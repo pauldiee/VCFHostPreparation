@@ -73,7 +73,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.3.0
+    Version : 2.4.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -146,6 +146,11 @@
                 flattens the structure; counts, HTML check rows, console
                 summary, and validationFailed detection all now use flattened
                 leaf checks
+        2.4.0 - Moved Get-AllLeafChecks to Helper Functions region so it is
+                accessible from all call sites; removed duplicate inline
+                flatten functions (Get-FlatChecks, Flatten-Checks) that were
+                scoped inside other functions and caused "not recognized"
+                errors at runtime
 #>
 
 [CmdletBinding()]
@@ -182,7 +187,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.3.0"
+    Version = "2.4.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -370,6 +375,29 @@ function Get-CommissionedHostIds {
     return $idMap
 }
 
+function Get-AllLeafChecks {
+    <#
+    .SYNOPSIS
+        Recursively flattens SDDC Manager validationChecks into a list of
+        leaf check objects. In VCF 9 the per-host checks are nested inside
+        a top-level wrapper entry rather than being siblings of it.
+    #>
+    param ([object[]]$Checks)
+
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($c in $Checks) {
+        $hasNested = $false
+        foreach ($np in @("nestedValidationChecks","nestedChecks","checkItems")) {
+            if ($c.PSObject.Properties[$np] -and $c.$np -and @($c.$np).Count -gt 0) {
+                $hasNested = $true
+                foreach ($n in (Get-AllLeafChecks $c.$np)) { $result.Add($n) }
+            }
+        }
+        if (-not $hasNested) { $result.Add($c) }
+    }
+    return $result
+}
+
 function Write-CommissionSummary {
     <#
     .SYNOPSIS
@@ -468,28 +496,6 @@ function Write-ValidationReport {
         $passCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "SUCCEEDED" } | Measure-Object).Count
         $failCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "FAILED"    } | Measure-Object).Count
         $warnCount = [int]@($hostChecks | Where-Object { $_.resultStatus -eq "WARNING"   } | Measure-Object).Count
-    }
-
-    # ── Helper: flatten all validation checks recursively ────────────────
-    # Top-level validationChecks may only contain wrapper entries; the actual
-    # per-host checks live inside nestedValidationChecks/nestedChecks etc.
-    function Get-AllLeafChecks ($checks) {
-        $result = [System.Collections.Generic.List[object]]::new()
-        foreach ($c in $checks) {
-            $hasNested = $false
-            foreach ($np in @("nestedValidationChecks","nestedChecks","checkItems")) {
-                if ($c.PSObject.Properties[$np] -and $c.$np -and @($c.$np).Count -gt 0) {
-                    $hasNested = $true
-                    foreach ($n in Get-AllLeafChecks $c.$np) { $result.Add($n) }
-                }
-            }
-            # Include this check itself only if it has no nested children
-            # (i.e. it is a leaf) OR if it directly represents a host check
-            if (-not $hasNested -or (Get-CheckFqdn $c)) {
-                $result.Add($c)
-            }
-        }
-        return $result
     }
 
     # ── Helper: collect all messages from a check object ──────────────────
@@ -1170,21 +1176,8 @@ try {
     # Determine actual failure from individual check results, NOT executionStatus.
     # SDDC Manager returns executionStatus="COMPLETED" even when checks fail --
     # the real failure state is in validationChecks[].resultStatus.
-    # Flatten all nested checks and exclude wrappers for accurate failure detection
-    $flatChecks = [System.Collections.Generic.List[object]]::new()
-    function Get-FlatChecks ($items) {
-        foreach ($c in $items) {
-            $hasNested = $false
-            foreach ($np in @("nestedValidationChecks","nestedChecks","checkItems")) {
-                if ($c.PSObject.Properties[$np] -and $c.$np -and @($c.$np).Count -gt 0) {
-                    $hasNested = $true; Get-FlatChecks $c.$np
-                }
-            }
-            if (-not $hasNested) { $flatChecks.Add($c) }
-        }
-    }
-    Get-FlatChecks $valStatus.validationChecks
-    $hostLevelChecks = $flatChecks | Where-Object {
+    # Flatten nested checks and exclude wrappers for accurate failure detection
+    $hostLevelChecks = Get-AllLeafChecks $valStatus.validationChecks | Where-Object {
         $_.description -notlike "*input specification*" -and
         $_.description -notlike "*Validating input*"
     }
@@ -1312,20 +1305,7 @@ try {
         $passCount = 0; $failCount = 0; $warnCount = 0
         if ($valStatus -and $valStatus.PSObject.Properties["validationChecks"]) {
             # Flatten nested checks and exclude wrappers -- mirrors Write-ValidationReport logic
-            $allLeaf = [System.Collections.Generic.List[object]]::new()
-            function Flatten-Checks ($items) {
-                foreach ($c in $items) {
-                    $hasNested = $false
-                    foreach ($np in @("nestedValidationChecks","nestedChecks","checkItems")) {
-                        if ($c.PSObject.Properties[$np] -and $c.$np -and @($c.$np).Count -gt 0) {
-                            $hasNested = $true; Flatten-Checks $c.$np
-                        }
-                    }
-                    if (-not $hasNested) { $allLeaf.Add($c) }
-                }
-            }
-            Flatten-Checks $valStatus.validationChecks
-            $hostChecks = $allLeaf | Where-Object {
+            $hostChecks = Get-AllLeafChecks $valStatus.validationChecks | Where-Object {
                 $_.description -notlike "*input specification*" -and
                 $_.description -notlike "*Validating input*"
             }
