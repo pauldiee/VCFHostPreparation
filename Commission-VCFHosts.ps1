@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.8.0
+    Version : 2.9.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -214,6 +214,11 @@
                 returns raw unencoded strings; HtmlEncode applied at render
                 time only; badge and message detail separated into block
                 elements so message wraps correctly below the PASS/FAIL badge
+        2.9.0 - Removed informational "Host spec validation succeeded." message
+                from PASS rows -- it was showing as a stray "H" due to PS 5.1
+                List[string] indexing behaviour; passing hosts now show PASS
+                badge only with no extra detail; FAIL rows still show the full
+                error message
 #>
 
 [CmdletBinding()]
@@ -250,7 +255,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.8.0"
+    Version = "2.9.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -769,11 +774,8 @@ function Write-ValidationReport {
         $msgColor  = if ($effectiveStatus -eq "SUCCEEDED") { "#8b949e" } else { "#f85149" }
         $msgDetail = if ($hasRealFailure) {
             "<div style='margin-top:4px;color:#f85149;font-size:0.8rem'>" + [System.Web.HttpUtility]::HtmlEncode($realFailureMsg) + "</div>"
-        } elseif ($msgs.Count -gt 0) {
-            # Show message in grey -- informational (e.g. "Host spec validation succeeded.")
-            "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>" + [System.Web.HttpUtility]::HtmlEncode($msgs[0]) + "</div>"
         } elseif ($effectiveStatus -eq "SUCCEEDED") {
-            "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>No issues detected</div>"
+            ""  # No extra detail for passing hosts -- "Host spec validation succeeded." is noise
         } else {
             "<div style='margin-top:4px;color:#f85149;font-size:0.8rem'>No detail available -- check ValidationResponse.json</div>"
         }
