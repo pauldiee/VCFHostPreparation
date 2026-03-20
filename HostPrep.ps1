@@ -123,7 +123,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.5.0
+    Version : 3.6.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -196,6 +196,11 @@
         3.4.0 - Added Test-DNSResolution: forward A record and reverse PTR
                 check per host before connect; DNS column in summary table
                 and HTML report; WARN for PTR issues, FAILED for no A record
+        3.6.0 - Added Get-ESXiStorageType helper: detects primary storage
+                type per host (VMFS_FC, NFS, VSAN_ESA, VSAN) via FC HBA
+                check, NFS datastore check, and vSAN disk group check;
+                detected type stored in $hostResult.StorageType and
+                written to the commissioning CSV per host
         3.5.0 - Added commissioning CSV export (HostPrep_<timestamp>_
                 Commissioning.csv) with FQDN, thumbprint and storage type
                 for hosts that connected successfully; added -CsvPath
@@ -231,7 +236,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.5.0"
+    Version = "3.6.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-19"
@@ -812,6 +817,75 @@ function Test-DNSResolution {
 }
 
 
+function Get-ESXiStorageType {
+    <#
+    .SYNOPSIS
+        Detects the primary storage type of a standalone ESXi host for use
+        in the VCF commissioning CSV.
+
+    .DESCRIPTION
+        Checks in order: FC HBAs, NFS datastores, vSAN ESA disk groups,
+        vSAN disk groups. Returns the first match as the SDDC Manager
+        storageType value. Falls back to VSAN if nothing is detected.
+
+        Valid SDDC Manager storageType values:
+          VSAN       - vSAN (OSA, original storage architecture)
+          VSAN_ESA   - vSAN Express Storage Architecture
+          NFS        - NFS datastore
+          VMFS_FC    - VMFS on Fibre Channel
+          VVOL       - Virtual Volumes (not auto-detected, set manually)
+
+    .PARAMETER VMHostObj
+        VMHost object returned by Get-VMHost.
+    #>
+    param (
+        [Parameter(Mandatory)]$VMHostObj
+    )
+
+    try {
+        # FC HBA check -- presence of FibreChannel HBAs indicates VMFS_FC intent
+        $fcHbas = Get-VMHostHba -VMHost $VMHostObj -Type FibreChannel -ErrorAction SilentlyContinue
+        if ($fcHbas -and @($fcHbas).Count -gt 0) {
+            Write-Host "  Storage type detected : VMFS_FC (Fibre Channel HBA present)" -ForegroundColor DarkGray
+            return "VMFS_FC"
+        }
+
+        # NFS check -- any NFS datastore mounted
+        $nfsDs = Get-Datastore -VMHost $VMHostObj -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Type -eq "NFS" -or $_.Type -eq "NFS41" }
+        if ($nfsDs -and @($nfsDs).Count -gt 0) {
+            Write-Host "  Storage type detected : NFS (NFS datastore mounted)" -ForegroundColor DarkGray
+            return "NFS"
+        }
+
+        # vSAN ESA check -- ESA uses a flat storage pool, no traditional disk groups
+        try {
+            $esxcli   = Get-EsxCli -VMHost $VMHostObj -V2 -ErrorAction SilentlyContinue
+            $vsanInfo = $esxcli.vsan.storage.list.Invoke()
+            if ($vsanInfo | Where-Object { $_.PSObject.Properties["PoolType"] -and $_.PoolType -eq "singleTier" }) {
+                Write-Host "  Storage type detected : VSAN_ESA (vSAN ESA storage pool)" -ForegroundColor DarkGray
+                return "VSAN_ESA"
+            }
+        } catch { }
+
+        # vSAN OSA check -- traditional disk groups
+        $vsanDgs = Get-VsanDiskGroup -VMHost $VMHostObj -ErrorAction SilentlyContinue
+        if ($vsanDgs -and @($vsanDgs).Count -gt 0) {
+            Write-Host "  Storage type detected : VSAN (vSAN disk group present)" -ForegroundColor DarkGray
+            return "VSAN"
+        }
+
+        # No definitive storage found -- default to VSAN for new VCF deployments
+        Write-Host "  Storage type detected : VSAN (default -- no specific storage detected)" -ForegroundColor DarkGray
+        return "VSAN"
+
+    } catch {
+        Write-Host "  Storage type detection failed: $_ -- defaulting to VSAN" -ForegroundColor Yellow
+        return "VSAN"
+    }
+}
+
+
 function Write-ColorSummaryTable {
     param (
         [System.Collections.Generic.List[PSCustomObject]]$Data
@@ -1234,6 +1308,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
         PasswordReset     = "Skipped"
         Thumbprint        = "N/A"
         Expiry            = "N/A"
+        StorageType       = "N/A"
         Error             = ""
     }
 
@@ -1271,6 +1346,10 @@ foreach ($esxiHost in $targetEsxiHosts) {
             $hostResult.Connected = $true
             Write-Host "  Connected to $esxiHost." -ForegroundColor Green
             $vmHostObj = Get-VMHost -Name $esxiHost -ErrorAction Stop
+
+            # Detect storage type immediately after connect while session is live
+            Write-Host "`n  [Storage Detection]" -ForegroundColor Cyan
+            $hostResult.StorageType = Get-ESXiStorageType -VMHostObj $vmHostObj
         }
 
         # --- WhatIfReport: cert/thumbprint read only, skip all other steps ---
@@ -1517,7 +1596,7 @@ $csvRows = $results | Where-Object { $_.Connected -eq $true -and $_.Thumbprint -
     Select-Object `
         @{ Name = "FQDN";        Expression = { $_.Host } },
         @{ Name = "Thumbprint";  Expression = { $_.Thumbprint } },
-        @{ Name = "StorageType"; Expression = { "VSAN" } }
+        @{ Name = "StorageType"; Expression = { $_.StorageType } }
 
 if ($csvRows) {
     $csvRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
