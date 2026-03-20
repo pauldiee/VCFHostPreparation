@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.7.0
+    Version : 2.8.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -210,6 +210,10 @@
                 to Helper Functions region; they were scoped inside
                 Write-ValidationReport and caused "not recognized" errors
                 when called from the validation and count logic outside it
+        2.8.0 - Fixed "H" cutoff in per-host summary: Get-CheckMessages now
+                returns raw unencoded strings; HtmlEncode applied at render
+                time only; badge and message detail separated into block
+                elements so message wraps correctly below the PASS/FAIL badge
 #>
 
 [CmdletBinding()]
@@ -246,7 +250,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.7.0"
+    Version = "2.8.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -438,6 +442,7 @@ function Get-CheckMessages {
     <#
     .SYNOPSIS
         Collects all message strings from an SDDC Manager check object.
+        Returns raw (unencoded) strings -- callers must HtmlEncode when rendering.
         Checks flat properties first, then errorResponse.message (VCF 9 structure).
     #>
     param ([object]$obj)
@@ -445,13 +450,13 @@ function Get-CheckMessages {
     $list = [System.Collections.Generic.List[string]]::new()
     foreach ($p in @("errorMessage","message","resultMessage")) {
         if ($obj.PSObject.Properties[$p] -and $obj.$p) {
-            $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.$p))
+            $list.Add($obj.$p)
         }
     }
     # SDDC Manager VCF 9 nests the message under errorResponse.message
     if ($obj.PSObject.Properties["errorResponse"] -and $obj.errorResponse) {
         if ($obj.errorResponse.PSObject.Properties["message"] -and $obj.errorResponse.message) {
-            $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.errorResponse.message))
+            $list.Add($obj.errorResponse.message)
         }
     }
     return $list
@@ -524,7 +529,7 @@ function Render-NestedChecks {
                 }
                 $nMsgs    = Get-CheckMessages $n
                 $nMsgHtml = if ($nMsgs.Count -gt 0) {
-                    "<span style='color:#8b949e;font-size:0.78rem'> -- " + ($nMsgs -join "; ") + "</span>"
+                    "<span style='color:#8b949e;font-size:0.78rem'> -- " + (($nMsgs | ForEach-Object { [System.Web.HttpUtility]::HtmlEncode($_) }) -join "; ") + "</span>"
                 } else { "" }
                 $html += "<li style='padding:2px 0'>$nIcon $([System.Web.HttpUtility]::HtmlEncode($n.description))$nMsgHtml"
                 $html += Render-NestedChecks $n
@@ -670,7 +675,7 @@ function Write-ValidationReport {
             }
             $msgs    = Get-CheckMessages $check
             $msgHtml = if ($msgs.Count -gt 0) {
-                "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>" + ($msgs -join "<br>") + "</div>"
+                "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>" + (($msgs | ForEach-Object { [System.Web.HttpUtility]::HtmlEncode($_) }) -join "<br>") + "</div>"
             } else { "" }
             $nested  = Render-NestedChecks $check
             $descCol = [System.Web.HttpUtility]::HtmlEncode($check.description) + $msgHtml + $nested
@@ -763,10 +768,10 @@ function Write-ValidationReport {
 
         $msgColor  = if ($effectiveStatus -eq "SUCCEEDED") { "#8b949e" } else { "#f85149" }
         $msgDetail = if ($hasRealFailure) {
-            "<ul style='margin:4px 0 0 0;padding-left:16px;color:#f85149;font-size:0.8rem'><li>$realFailureMsg</li></ul>"
+            "<div style='margin-top:4px;color:#f85149;font-size:0.8rem'>" + [System.Web.HttpUtility]::HtmlEncode($realFailureMsg) + "</div>"
         } elseif ($msgs.Count -gt 0) {
-            # Show message in grey -- it is informational (e.g. "spec validation succeeded")
-            "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>$($msgs[0])</div>"
+            # Show message in grey -- informational (e.g. "Host spec validation succeeded.")
+            "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>" + [System.Web.HttpUtility]::HtmlEncode($msgs[0]) + "</div>"
         } elseif ($effectiveStatus -eq "SUCCEEDED") {
             "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>No issues detected</div>"
         } else {
@@ -778,7 +783,7 @@ function Write-ValidationReport {
             <td>$([System.Web.HttpUtility]::HtmlEncode($h.FQDN))</td>
             <td style='font-family:Consolas,monospace;font-size:0.72rem;color:#79c0ff;word-break:break-all'>$([System.Web.HttpUtility]::HtmlEncode($h.Thumbprint))</td>
             <td>$([System.Web.HttpUtility]::HtmlEncode($h.StorageType))</td>
-            <td>$statusBadge$msgDetail</td>
+            <td><div>$statusBadge</div>$msgDetail</td>
         </tr>"
     }
 
