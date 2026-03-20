@@ -17,9 +17,11 @@
          wait for the host to return online
       7. Optionally reset the root account password (asked interactively)
 
-    After all hosts are processed, an HTML report is generated in the same
-    folder as the script containing the SHA-256 SSL thumbprint for each host,
-    ready to use when commissioning hosts into SDDC Manager.
+    After all hosts are processed, an HTML commissioning report and a CSV
+    file are generated next to the script. The HTML report contains the
+    SHA256:<base64> thumbprint for each host ready to paste into SDDC Manager.
+    The CSV is consumed by the companion Commission-VCFHosts.ps1 script to
+    automate the commissioning step.
 
     Optional Advanced Settings
     --------------------------
@@ -102,6 +104,11 @@
     thumbprints before running the full script. Credentials are still
     required to connect.
 
+.PARAMETER CsvPath
+    Path to write the commissioning CSV file. Defaults to the same folder
+    as the script. The CSV is consumed by Commission-VCFHosts.ps1 and
+    contains one row per host with FQDN, thumbprint, and storage type.
+
 .EXAMPLE
     .\HostPrep.ps1
 
@@ -116,10 +123,10 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.4.0
+    Version : 3.5.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-03-19
+    Date    : 2026-03-20
 
     Changelog:
         1.0.0 - Initial release
@@ -158,49 +165,42 @@
         2.8.0 - PowerCLI CEIP opt-out persisted to User scope on first run;
                 InvalidCertificateAction set to Ignore for the session;
                 removed unused Windows.Forms assembly; cleaned up description
-        2.9.0 - Test-ESXiCertificateNeedsRegen now returns a structured
-                object including SHA-256 thumbprint, CN and expiry;
-                thumbprint re-read after cert regen to reflect new cert;
-                HTML report generated after run with thumbprints ready for
-                SDDC Manager commissioning; added -ReportPath parameter
-        2.9.1 - Fixed HTML report Successful count (Measure-Object + [int]
-                cast prevents single-result .Count returning empty);
-                moved Add-Type System.Web to Initialisation region
-        3.0.0 - Added $OptionalAdvancedSettings config hashtable for
-                per-deployment optional settings (disabled by default);
-                includes esxAdminsGroup, lsomEnableRebuildOnLSE, and
-                SSD TRIM settings (HardwareAcceleratedMove/Init);
-                added OptionalSettings column to summary table;
-                expanded description with optional settings documentation
+        2.9.0 - Test-ESXiCertificateNeedsRegen returns a structured object
+                with SHA-256 thumbprint, CN and expiry; thumbprint re-read
+                after cert regen to reflect new cert; HTML commissioning
+                report generated after run; added -ReportPath parameter
+        2.9.1 - Fixed HTML report Successful count; moved Add-Type System.Web
+                to Initialisation region
+        3.0.0 - Added $OptionalAdvancedSettings config hashtable with four
+                optional settings (esxAdminsGroup, lsomEnableRebuildOnLSE,
+                HardwareAcceleratedMove/Init); OptionalSettings column added
+                to summary table; description expanded
         3.1.0 - Per-setting try/catch in optional settings loop with Partial
-                state; Wait-ESXiHostOnline return value checked; type notes
-                and re-run warning in $OptionalAdvancedSettings comments;
+                state; type notes and re-run warning added to comments;
                 added -WhatIfReport switch; HTML report gains clipboard copy
                 button, cert expiry column with amber/red highlighting, and
                 Optional Settings column; Expiry stored in $hostResult
         3.2.0 - Fixed $summaryWidth undefined; WhatIfReport overallOk logic
-                corrected; CertRegen 'OK' in WhatIfReport now shows
-                'Not needed'; removed dead-code hostOnline check;
-                password reset Y/N prompt skipped during WhatIfReport;
-                Posh-SSH warning suppressed during WhatIfReport
-        3.3.0 - Reboot timeout sets Rebooted='Timeout' and surfaces a clear
-                error in $hostResult.Error instead of CertRegen; prominent
-                red banner printed immediately on timeout; finally block
-                skips Disconnect-VIServer when host never came back to
-                avoid noisy ObjectNotFound error; Timeout added to colour
-                table, HTML report Rebooted cell, and legend
-        3.3.1 - Fixed thumbprint format from colon-separated hex (XX:XX:...)
-                to SHA256:<base64> to match the SDDC Manager commissioning
-                UI exactly; HTML report header, column label, and note text
-                updated accordingly; UTF-8 BOM added to fix Windows
-                PowerShell encoding issues; em-dashes replaced with ASCII;
-                Write-ColorSummaryTable and Write-HtmlReport moved before
-                executable code to fix parse errors on all PS versions
-        3.4.0 - Added Test-DNSResolution helper: forward A record and
-                reverse PTR check per host before connect; DNS column added
-                to summary table and HTML report; WARN for PTR mismatch or
-                missing PTR, FAILED for no A record at all; DNS issues flag
-                action required but do not block remaining steps
+                corrected; CertRegen OK in WhatIfReport shows Not needed;
+                password reset prompt and Posh-SSH warning skipped in
+                WhatIfReport mode
+        3.3.0 - Reboot timeout sets Rebooted=Timeout and surfaces a clear
+                error in $hostResult.Error; prominent red banner on timeout;
+                finally block skips disconnect when host never came back;
+                Timeout state added to colour table, HTML report, and legend
+        3.3.1 - Thumbprint format changed from colon-separated hex to
+                SHA256:<base64> to match SDDC Manager commissioning UI;
+                UTF-8 BOM added; em-dashes replaced with ASCII hyphens;
+                Write-ColorSummaryTable, Write-HtmlReport and Get-CellColor
+                moved to Helper Functions region to fix PS parse errors
+        3.4.0 - Added Test-DNSResolution: forward A record and reverse PTR
+                check per host before connect; DNS column in summary table
+                and HTML report; WARN for PTR issues, FAILED for no A record
+        3.5.0 - Added commissioning CSV export (HostPrep_<timestamp>_
+                Commissioning.csv) with FQDN, thumbprint and storage type
+                for hosts that connected successfully; added -CsvPath
+                parameter; companion script Commission-VCFHosts.ps1 reads
+                this CSV to automate the SDDC Manager commissioning step
 #>
 
 [CmdletBinding()]
@@ -219,6 +219,11 @@ param (
     [string]$ReportPath = [System.IO.Path]::Combine(
         $PSScriptRoot,
         "HostPrep_$(Get-Date -Format 'yyyyMMdd_HHmmss')_Report.html"
+    ),
+
+    [string]$CsvPath = [System.IO.Path]::Combine(
+        $PSScriptRoot,
+        "HostPrep_$(Get-Date -Format 'yyyyMMdd_HHmmss')_Commissioning.csv"
     )
 )
 
@@ -226,7 +231,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.4.0"
+    Version = "3.5.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-19"
@@ -1505,6 +1510,22 @@ Write-Host ""
 Write-Host ("  Log written to    : {0}" -f $LogPath) -ForegroundColor DarkGray
 
 Write-HtmlReport -Data $results -ReportPath $ReportPath
+
+# Export commissioning CSV for use by Commission-VCFHosts.ps1
+# Only includes hosts that connected successfully and have a valid thumbprint
+$csvRows = $results | Where-Object { $_.Connected -eq $true -and $_.Thumbprint -ne "N/A" } |
+    Select-Object `
+        @{ Name = "FQDN";        Expression = { $_.Host } },
+        @{ Name = "Thumbprint";  Expression = { $_.Thumbprint } },
+        @{ Name = "StorageType"; Expression = { "VSAN" } }
+
+if ($csvRows) {
+    $csvRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host ("  Commissioning CSV : {0}" -f $CsvPath) -ForegroundColor Cyan
+    Write-Host ("  {0} host(s) exported to CSV." -f @($csvRows).Count) -ForegroundColor DarkGray
+} else {
+    Write-Host "  No hosts with valid thumbprints  --  CSV not written." -ForegroundColor Yellow
+}
 
 Write-Host ("=" * $summaryWidth) -ForegroundColor DarkCyan
 Write-Host ""
