@@ -839,7 +839,7 @@ function Get-ESXiStorageType {
 
         Valid SDDC Manager storageType values:
           VSAN       - vSAN Original Storage Architecture (OSA)  [default]
-          VSAN_ESA   - vSAN Express Storage Architecture -- set manually
+          VSAN_ESA   - vSAN Express Storage Architecture -- edit CSV manually
           NFS        - NFS datastore                            -- auto-detected
           VMFS_FC    - VMFS on Fibre Channel                    -- auto-detected
           VVOL       - Virtual Volumes                          -- set manually
@@ -869,7 +869,7 @@ function Get-ESXiStorageType {
 
         # Default -- vSAN hosts have unclaimed disks at commissioning time;
         # OSA vs ESA is a design choice and must be set manually if ESA is intended.
-        Write-Host "  Storage type detected : VSAN (default -- override to VSAN_ESA in Commission-VCFHosts.ps1 if needed)" -ForegroundColor DarkGray
+        Write-Host "  Storage type detected : VSAN (default -- edit StorageType in the CSV to VSAN_ESA or VVOL if needed)" -ForegroundColor DarkGray
         return "VSAN"
 
     } catch {
@@ -1352,9 +1352,10 @@ foreach ($esxiHost in $targetEsxiHosts) {
             $hostResult.Thumbprint = $certCheck.Thumbprint
             $hostResult.Expiry     = $certCheck.Expiry
             $hostResult.CertRegen  = if ($certCheck.NeedsRegen) { "Regen needed" } else { "OK" }
-            Write-Host "  Thumbprint : $($certCheck.Thumbprint)" -ForegroundColor DarkGray
-            Write-Host "  CN         : $($certCheck.CN)"         -ForegroundColor DarkGray
-            Write-Host "  Expiry     : $($certCheck.Expiry)"     -ForegroundColor DarkGray
+            Write-Host "  Thumbprint   : $($certCheck.Thumbprint)" -ForegroundColor DarkGray
+            Write-Host "  CN           : $($certCheck.CN)"         -ForegroundColor DarkGray
+            Write-Host "  Expiry       : $($certCheck.Expiry)"     -ForegroundColor DarkGray
+            Write-Host "  Storage type : $($hostResult.StorageType)  (edit CSV to VSAN_ESA or VVOL if needed)" -ForegroundColor DarkGray
             # Skip all remaining steps  --  fall through to finally for clean disconnect
         } else {
 
