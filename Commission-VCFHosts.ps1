@@ -73,7 +73,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 1.4.0
+    Version : 1.7.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -96,6 +96,20 @@
         1.4.0 - Storage type is now per-host from the CSV (detected by
                 HostPrep.ps1); interactive per-host override prompt at
                 runtime replaces the single batch-level storage prompt
+        1.5.0 - On validation failure: sanitised JSON payload (password
+                masked) and full validation response always saved to disk;
+                -SavePayload switch saves payload on every run regardless;
+                -PayloadPath parameter controls output path; per-check
+                output now drills into nested validation checks and prints
+                all available error/message properties per check
+        1.6.0 - Added Write-ValidationReport: dark-mode HTML report generated
+                after -ValidateOnly runs (pass or fail) and after validation
+                failure during normal runs; shows per-check results with
+                nested check detail, host list, overall status, and SDDC
+                Manager metadata; -ValidateReportPath parameter added
+        1.7.0 - Fixed Get-SddcManagerVersion: now queries GET /v1/sddc-managers
+                (correct endpoint, returns elements[].version) with fallback
+                to GET /v1/system/about; resolves "Unknown" version display
 #>
 
 [CmdletBinding()]
@@ -105,6 +119,7 @@ param (
     [int]$TimeoutMinutes = 30,
     [switch]$ValidateOnly,
     [switch]$SkipCertificateCheck,
+    [switch]$SavePayload,
 
     [string]$ReportPath = [System.IO.Path]::Combine(
         (Split-Path -Parent $MyInvocation.MyCommand.Path),
@@ -114,6 +129,16 @@ param (
     [string]$OutputCsvPath = [System.IO.Path]::Combine(
         (Split-Path -Parent $MyInvocation.MyCommand.Path),
         "Commission_$(Get-Date -Format 'yyyyMMdd_HHmmss')_Results.csv"
+    ),
+
+    [string]$PayloadPath = [System.IO.Path]::Combine(
+        (Split-Path -Parent $MyInvocation.MyCommand.Path),
+        "Commission_$(Get-Date -Format 'yyyyMMdd_HHmmss')_Payload.json"
+    ),
+
+    [string]$ValidateReportPath = [System.IO.Path]::Combine(
+        (Split-Path -Parent $MyInvocation.MyCommand.Path),
+        "Commission_$(Get-Date -Format 'yyyyMMdd_HHmmss')_ValidationReport.html"
     )
 )
 
@@ -121,7 +146,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "1.4.0"
+    Version = "1.7.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -242,16 +267,31 @@ function Get-SddcManagerToken {
 function Get-SddcManagerVersion {
     <#
     .SYNOPSIS
-        Retrieves the SDDC Manager product version for API compatibility display.
+        Retrieves the SDDC Manager product version.
+
+    .DESCRIPTION
+        Tries GET /v1/sddc-managers first (current API, returns elements[].version),
+        then falls back to GET /v1/system/about (older API). Returns "Unknown" if
+        neither endpoint responds.
     #>
     param ([string]$SddcManager, [string]$Token)
 
+    # Primary: GET /v1/sddc-managers -- returns a singleton list; version is in elements[0]
+    try {
+        $response = Invoke-SddcManagerApi -Uri "https://$SddcManager/v1/sddc-managers" -Token $Token
+        if ($response.elements -and @($response.elements).Count -gt 0) {
+            $ver = $response.elements[0].version
+            if ($ver) { return $ver }
+        }
+    } catch { }
+
+    # Fallback: GET /v1/system/about (older VCF versions)
     try {
         $info = Invoke-SddcManagerApi -Uri "https://$SddcManager/v1/system/about" -Token $Token
-        return $info.version
-    } catch {
-        return "Unknown"
-    }
+        if ($info.version) { return $info.version }
+    } catch { }
+
+    return "Unknown"
 }
 
 function Get-NetworkPools {
@@ -351,6 +391,224 @@ function Write-CommissionSummary {
 
     Write-Host $divider -ForegroundColor DarkCyan
 }
+function Write-ValidationReport {
+    <#
+    .SYNOPSIS
+        Generates a dark-themed self-contained HTML validation report.
+    #>
+    param (
+        [object]$ValidationStatus,
+        [string]$Path,
+        [string]$ValidationId,
+        [string]$SddcManager,
+        [string]$SddcVersion,
+        [string]$NetworkPool,
+        [string]$ScriptVersion,
+        [array]$Hosts
+    )
+
+    $generatedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $passCount   = 0; $failCount = 0; $warnCount = 0
+    $overallStatus = "PASSED"
+
+    if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
+        $passCount = [int]@($ValidationStatus.validationChecks | Where-Object { $_.resultStatus -eq "SUCCEEDED" } | Measure-Object).Count
+        $failCount = [int]@($ValidationStatus.validationChecks | Where-Object { $_.resultStatus -eq "FAILED"    } | Measure-Object).Count
+        $warnCount = [int]@($ValidationStatus.validationChecks | Where-Object { $_.resultStatus -eq "WARNING"   } | Measure-Object).Count
+    }
+    if ($failCount -gt 0) { $overallStatus = "FAILED" } elseif ($warnCount -gt 0) { $overallStatus = "WARNING" }
+
+    # Build check rows
+    $checkRows = ""
+    if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
+        foreach ($check in $ValidationStatus.validationChecks) {
+            $rowClass = switch ($check.resultStatus) {
+                "SUCCEEDED" { "ok"   }
+                "FAILED"    { "fail" }
+                "WARNING"   { "warn" }
+                default     { ""     }
+            }
+            $statusDisplay = switch ($check.resultStatus) {
+                "SUCCEEDED" { "<span style='color:#3fb950'>&#10004; PASS</span>" }
+                "FAILED"    { "<span style='color:#f85149'>&#10008; FAIL</span>" }
+                "WARNING"   { "<span style='color:#d29922'>&#9888; WARN</span>"  }
+                default     { "<span style='color:#8b949e'>$([System.Web.HttpUtility]::HtmlEncode($check.resultStatus))</span>" }
+            }
+
+            # Collect error messages
+            $msgs = [System.Collections.Generic.List[string]]::new()
+            foreach ($msgProp in @("errorMessage","message","resultMessage")) {
+                if ($check.PSObject.Properties[$msgProp] -and $check.$msgProp) {
+                    $msgs.Add([System.Web.HttpUtility]::HtmlEncode($check.$msgProp))
+                }
+            }
+
+            # Collect nested checks
+            $nestedHtml = ""
+            foreach ($nestedProp in @("nestedValidationChecks","nestedChecks","validationChecks")) {
+                if ($check.PSObject.Properties[$nestedProp] -and $check.$nestedProp) {
+                    $nestedHtml += "<ul style='margin:6px 0 0 0;padding-left:18px;list-style:none'>"
+                    foreach ($nested in $check.$nestedProp) {
+                        $nestedIcon = switch ($nested.resultStatus) {
+                            "SUCCEEDED" { "<span style='color:#3fb950'>&#10004;</span>" }
+                            "FAILED"    { "<span style='color:#f85149'>&#10008;</span>" }
+                            "WARNING"   { "<span style='color:#d29922'>&#9888;</span>"  }
+                            default     { "<span style='color:#8b949e'>&#9679;</span>"  }
+                        }
+                        $nestedMsg = ""
+                        foreach ($mp in @("errorMessage","message","resultMessage")) {
+                            if ($nested.PSObject.Properties[$mp] -and $nested.$mp) {
+                                $nestedMsg = " <span style='color:#8b949e;font-size:0.8rem'>-- $([System.Web.HttpUtility]::HtmlEncode($nested.$mp))</span>"
+                                break
+                            }
+                        }
+                        $nestedHtml += "<li>$nestedIcon $([System.Web.HttpUtility]::HtmlEncode($nested.description))$nestedMsg</li>"
+                    }
+                    $nestedHtml += "</ul>"
+                }
+            }
+
+            $msgHtml = if ($msgs.Count -gt 0) {
+                "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>" + ($msgs -join "<br>") + "</div>"
+            } else { "" }
+
+            $descCol = [System.Web.HttpUtility]::HtmlEncode($check.description) + $msgHtml + $nestedHtml
+
+            $checkRows += "
+        <tr class='$rowClass'>
+            <td>$statusDisplay</td>
+            <td>$descCol</td>
+        </tr>"
+        }
+    }
+
+    # Host list rows
+    $hostRows = ""
+    foreach ($h in $Hosts) {
+        $hostRows += "
+        <tr>
+            <td>$([System.Web.HttpUtility]::HtmlEncode($h.FQDN))</td>
+            <td style='font-family:Consolas,monospace;font-size:0.75rem;color:#79c0ff'>$([System.Web.HttpUtility]::HtmlEncode($h.Thumbprint))</td>
+            <td>$([System.Web.HttpUtility]::HtmlEncode($h.StorageType))</td>
+        </tr>"
+    }
+
+    $overallColor = switch ($overallStatus) {
+        "PASSED"  { "#3fb950" }
+        "FAILED"  { "#f85149" }
+        "WARNING" { "#d29922" }
+        default   { "#c9d1d9" }
+    }
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCF Validation Report</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #0d1117; color: #c9d1d9; padding: 32px; }
+  header { margin-bottom: 28px; border-bottom: 2px solid #1f6feb; padding-bottom: 16px; }
+  header h1 { font-size: 1.6rem; color: #58a6ff; letter-spacing: 0.5px; }
+  header p  { font-size: 0.85rem; color: #8b949e; margin-top: 4px; }
+  .meta { display: flex; gap: 20px; margin-bottom: 24px; flex-wrap: wrap; }
+  .meta-item { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 20px; min-width: 140px; }
+  .meta-item .label { font-size: 0.72rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+  .meta-item .value { font-size: 1.1rem; font-weight: 600; color: #c9d1d9; margin-top: 2px; }
+  .info-bar { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 20px; margin-bottom: 24px; font-size: 0.83rem; display: flex; gap: 32px; flex-wrap: wrap; }
+  .info-bar span { color: #8b949e; }
+  .info-bar strong { color: #c9d1d9; }
+  h2 { font-size: 1rem; color: #58a6ff; margin: 24px 0 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: #161b22; border-radius: 8px; overflow: hidden; border: 1px solid #30363d; margin-bottom: 24px; }
+  thead th { background: #1f2937; color: #58a6ff; padding: 10px 14px; text-align: left; font-weight: 600; letter-spacing: 0.4px; border-bottom: 2px solid #1f6feb; }
+  tbody tr { border-bottom: 1px solid #21262d; }
+  tbody tr:hover { background: #1c2128; }
+  tbody tr:last-child { border-bottom: none; }
+  td { padding: 10px 14px; vertical-align: top; }
+  tr.ok   td:first-child { border-left: 3px solid #3fb950; }
+  tr.fail td:first-child { border-left: 3px solid #f85149; }
+  tr.warn td:first-child { border-left: 3px solid #d29922; }
+  .note { font-size: 0.8rem; color: #8b949e; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; margin-top: 8px; }
+  footer { margin-top: 28px; font-size: 0.75rem; color: #6e7681; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>&#128203; VCF Host Commissioning Validation Report</h1>
+  <p>Generated by Commission-VCFHosts.ps1 v$ScriptVersion &bull; $generatedAt</p>
+</header>
+
+<div class="meta">
+  <div class="meta-item">
+    <div class="label">Overall</div>
+    <div class="value" style="color:$overallColor">$overallStatus</div>
+  </div>
+  <div class="meta-item">
+    <div class="label">Passed</div>
+    <div class="value" style="color:#3fb950">$passCount</div>
+  </div>
+  <div class="meta-item">
+    <div class="label">Warnings</div>
+    <div class="value" style="color:#d29922">$warnCount</div>
+  </div>
+  <div class="meta-item">
+    <div class="label">Failed</div>
+    <div class="value" style="color:#f85149">$failCount</div>
+  </div>
+</div>
+
+<div class="info-bar">
+  <div><span>SDDC Manager: </span><strong>$([System.Web.HttpUtility]::HtmlEncode($SddcManager))</strong></div>
+  <div><span>Version: </span><strong>$([System.Web.HttpUtility]::HtmlEncode($SddcVersion))</strong></div>
+  <div><span>Network Pool: </span><strong>$([System.Web.HttpUtility]::HtmlEncode($NetworkPool))</strong></div>
+  <div><span>Validation ID: </span><strong><code style='font-size:0.8rem;color:#79c0ff'>$([System.Web.HttpUtility]::HtmlEncode($ValidationId))</code></strong></div>
+</div>
+
+<h2>Validation Checks</h2>
+<table>
+  <thead>
+    <tr>
+      <th style="width:110px">Result</th>
+      <th>Check</th>
+    </tr>
+  </thead>
+  <tbody>
+    $checkRows
+  </tbody>
+</table>
+
+<h2>Hosts Validated</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Host FQDN</th>
+      <th>Thumbprint</th>
+      <th>Storage Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    $hostRows
+  </tbody>
+</table>
+
+<div class="note">
+  No hosts were commissioned. This report reflects the pre-commissioning validation
+  only. $(if ($overallStatus -eq 'PASSED') { 'All checks passed -- run without -ValidateOnly to commission.' } else { 'Fix the failed checks above before commissioning.' })
+</div>
+
+<footer>Commission-VCFHosts.ps1 &bull; Paul van Dieen &bull; https://www.hollebollevsan.nl</footer>
+
+</body>
+</html>
+"@
+
+    $html | Out-File -FilePath $Path -Encoding UTF8
+    Write-Host ("  Validation report written to: {0}" -f $Path) -ForegroundColor Cyan
+}
+
 
 function Write-CommissionCsv {
     <#
@@ -681,6 +939,20 @@ $hostPayload = foreach ($h in $hosts) {
     }
 }
 
+# Save sanitised payload to disk before clearing the password.
+# The password field is masked -- the file is safe to share for debugging.
+$sanitisedPayload = $hostPayload | ForEach-Object {
+    $copy = $_.Clone()
+    $copy["password"] = "********"
+    $copy
+}
+$payloadJson = $sanitisedPayload | ConvertTo-Json -Depth 10
+
+if ($SavePayload) {
+    $payloadJson | Out-File -FilePath $PayloadPath -Encoding UTF8
+    Write-Host ("  Payload saved to: {0}" -f $PayloadPath) -ForegroundColor DarkGray
+}
+
 # Clear plaintext password from memory immediately after payload is built
 $esxiPlain = [string]::new('*', 16)
 Remove-Variable esxiPlain -ErrorAction SilentlyContinue
@@ -716,9 +988,9 @@ try {
     if ($valStatus -and $valStatus.PSObject.Properties["validationChecks"]) {
         foreach ($check in $valStatus.validationChecks) {
             $checkColor = switch ($check.resultStatus) {
-                "SUCCEEDED" { "Green"  }
-                "FAILED"    { "Red"    }
-                "WARNING"   { "Yellow" }
+                "SUCCEEDED" { "Green"    }
+                "FAILED"    { "Red"      }
+                "WARNING"   { "Yellow"   }
                 default     { "DarkGray" }
             }
             $icon = switch ($check.resultStatus) {
@@ -728,20 +1000,75 @@ try {
                 default     { "[INFO]" }
             }
             Write-Host ("    {0} {1}" -f $icon, $check.description) -ForegroundColor $checkColor
-            if ($check.resultStatus -in @("FAILED","WARNING") -and $check.PSObject.Properties["errorMessage"] -and $check.errorMessage) {
-                Write-Host ("           {0}" -f $check.errorMessage) -ForegroundColor DarkGray
+
+            # Print any error or result message on the check itself
+            foreach ($msgProp in @("errorMessage","message","resultMessage")) {
+                if ($check.PSObject.Properties[$msgProp] -and $check.$msgProp) {
+                    Write-Host ("           $msgProp : $($check.$msgProp)") -ForegroundColor DarkGray
+                }
+            }
+
+            # Drill into nested checks if present (SDDC Manager sometimes nests per-host details)
+            foreach ($nestedProp in @("nestedValidationChecks","nestedChecks","validationChecks")) {
+                if ($check.PSObject.Properties[$nestedProp] -and $check.$nestedProp) {
+                    foreach ($nested in $check.$nestedProp) {
+                        $nestedColor = if ($nested.resultStatus -eq "FAILED") { "Red" } elseif ($nested.resultStatus -eq "WARNING") { "Yellow" } else { "DarkGray" }
+                        $nestedIcon  = if ($nested.resultStatus -eq "FAILED") { "[FAIL]" } elseif ($nested.resultStatus -eq "WARNING") { "[WARN]" } else { "[INFO]" }
+                        Write-Host ("      $nestedIcon $($nested.description)") -ForegroundColor $nestedColor
+                        foreach ($msgProp in @("errorMessage","message","resultMessage")) {
+                            if ($nested.PSObject.Properties[$msgProp] -and $nested.$msgProp) {
+                                Write-Host ("             $msgProp : $($nested.$msgProp)") -ForegroundColor DarkGray
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     Write-Host ""
 
+    # Also dump the raw validation response for inspection
+    Write-Host "  Raw validation response saved to console log above." -ForegroundColor DarkGray
+    Write-Host ("  Validation ID: {0}" -f $validation.id) -ForegroundColor DarkGray
+    Write-Host ""
+
     if ($valStatus.executionStatus -eq "FAILED") {
+        # Always save payload on validation failure so the user can inspect what was sent
+        if (-not $SavePayload) {
+            $payloadJson | Out-File -FilePath $PayloadPath -Encoding UTF8
+            Write-Host ("  Payload saved to: {0}" -f $PayloadPath) -ForegroundColor Yellow
+            Write-Host "  Review this file to verify the FQDN, thumbprint, storage type and network pool that were sent." -ForegroundColor Yellow
+        }
+        # Also dump the raw validation status as JSON for full inspection
+        $valJsonPath = $PayloadPath -replace '_Payload\.json$', '_ValidationResponse.json'
+        $valStatus | ConvertTo-Json -Depth 10 | Out-File -FilePath $valJsonPath -Encoding UTF8
+        Write-Host ("  Full validation response saved to: {0}" -f $valJsonPath) -ForegroundColor Yellow
+        Write-Host ""
         Write-Host "  Validation FAILED -- fix the errors above before commissioning." -ForegroundColor Red
         if ($ValidateOnly) {
+            Write-ValidationReport `
+                -ValidationStatus $valStatus `
+                -Path             $ValidateReportPath `
+                -ValidationId     $validation.id `
+                -SddcManager      $SddcManager `
+                -SddcVersion      $sddcVersion `
+                -NetworkPool      $selectedPool.name `
+                -ScriptVersion    $ScriptMeta.Version `
+                -Hosts            @($hosts)
             Write-Host ("=" * 62) -ForegroundColor DarkCyan
             Write-Host ""
             exit 1
         }
+        # Also write validation report on normal-mode failure before aborting
+        Write-ValidationReport `
+            -ValidationStatus $valStatus `
+            -Path             $ValidateReportPath `
+            -ValidationId     $validation.id `
+            -SddcManager      $SddcManager `
+            -SddcVersion      $sddcVersion `
+            -NetworkPool      $selectedPool.name `
+            -ScriptVersion    $ScriptMeta.Version `
+            -Hosts            @($hosts)
         exit 1
     }
 
@@ -767,6 +1094,16 @@ try {
         Write-Host ("  Checks failed  : {0}" -f $failCount)        -ForegroundColor $(if ($failCount -gt 0) { "Red" } else { "DarkGray" })
         Write-Host ""
         Write-Host "  No hosts were commissioned. Run without -ValidateOnly to proceed." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-ValidationReport `
+            -ValidationStatus $valStatus `
+            -Path             $ValidateReportPath `
+            -ValidationId     $validation.id `
+            -SddcManager      $SddcManager `
+            -SddcVersion      $sddcVersion `
+            -NetworkPool      $selectedPool.name `
+            -ScriptVersion    $ScriptMeta.Version `
+            -Hosts            @($hosts)
         Write-Host ("=" * 62) -ForegroundColor DarkCyan
         Write-Host ""
         exit 0
