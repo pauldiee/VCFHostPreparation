@@ -73,7 +73,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 1.8.0
+    Version : 1.9.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -117,6 +117,11 @@
                 of outcome; per-check drilling extended to 3 levels deep and
                 covers checkItems property; executionStatus and check counts
                 printed for transparency
+        1.9.0 - Write-ValidationReport rebuilt: per-host failure summary table
+                added at the top showing which hosts have issues and the
+                specific failure messages extracted from nested checks; nested
+                check rendering refactored into recursive helper functions;
+                all HTML reports auto-open in the default browser after writing
 #>
 
 [CmdletBinding()]
@@ -153,7 +158,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "1.8.0"
+    Version = "1.9.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -402,6 +407,8 @@ function Write-ValidationReport {
     <#
     .SYNOPSIS
         Generates a dark-themed self-contained HTML validation report.
+        Shows per-check results with nested detail AND a per-host failure
+        summary so it is immediately clear which hosts failed which checks.
     #>
     param (
         [object]$ValidationStatus,
@@ -414,8 +421,8 @@ function Write-ValidationReport {
         [array]$Hosts
     )
 
-    $generatedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $passCount   = 0; $failCount = 0; $warnCount = 0
+    $generatedAt   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $passCount     = 0; $failCount = 0; $warnCount = 0
     $overallStatus = "PASSED"
 
     if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
@@ -425,7 +432,46 @@ function Write-ValidationReport {
     }
     if ($failCount -gt 0) { $overallStatus = "FAILED" } elseif ($warnCount -gt 0) { $overallStatus = "WARNING" }
 
-    # Build check rows
+    # ── Helper: collect all messages from a check object ──────────────────
+    function Get-CheckMessages ($obj) {
+        $list = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in @("errorMessage","message","resultMessage")) {
+            if ($obj.PSObject.Properties[$p] -and $obj.$p) {
+                $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.$p))
+            }
+        }
+        return $list
+    }
+
+    # ── Helper: recursively render nested checks as HTML ──────────────────
+    function Render-NestedChecks ($parentObj) {
+        $html = ""
+        foreach ($np in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
+            if ($parentObj.PSObject.Properties[$np] -and $parentObj.$np) {
+                $html += "<ul style='margin:6px 0 0 0;padding-left:16px;list-style:none'>"
+                foreach ($n in $parentObj.$np) {
+                    $nIcon = switch ($n.resultStatus) {
+                        "SUCCEEDED" { "<span style='color:#3fb950'>&#10004;</span>" }
+                        "FAILED"    { "<span style='color:#f85149'>&#10008;</span>" }
+                        "WARNING"   { "<span style='color:#d29922'>&#9888;</span>"  }
+                        default     { "<span style='color:#8b949e'>&#9679;</span>"  }
+                    }
+                    $nMsgs = Get-CheckMessages $n
+                    $nMsgHtml = if ($nMsgs.Count -gt 0) {
+                        "<span style='color:#8b949e;font-size:0.78rem'> -- " + ($nMsgs -join "; ") + "</span>"
+                    } else { "" }
+                    $html += "<li style='padding:2px 0'>$nIcon $([System.Web.HttpUtility]::HtmlEncode($n.description))$nMsgHtml"
+                    $html += Render-NestedChecks $n
+                    $html += "</li>"
+                }
+                $html += "</ul>"
+                break  # only process the first matching property per level
+            }
+        }
+        return $html
+    }
+
+    # ── Build check rows ───────────────────────────────────────────────────
     $checkRows = ""
     if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
         foreach ($check in $ValidationStatus.validationChecks) {
@@ -441,45 +487,12 @@ function Write-ValidationReport {
                 "WARNING"   { "<span style='color:#d29922'>&#9888; WARN</span>"  }
                 default     { "<span style='color:#8b949e'>$([System.Web.HttpUtility]::HtmlEncode($check.resultStatus))</span>" }
             }
-
-            # Collect error messages
-            $msgs = [System.Collections.Generic.List[string]]::new()
-            foreach ($msgProp in @("errorMessage","message","resultMessage")) {
-                if ($check.PSObject.Properties[$msgProp] -and $check.$msgProp) {
-                    $msgs.Add([System.Web.HttpUtility]::HtmlEncode($check.$msgProp))
-                }
-            }
-
-            # Collect nested checks
-            $nestedHtml = ""
-            foreach ($nestedProp in @("nestedValidationChecks","nestedChecks","validationChecks")) {
-                if ($check.PSObject.Properties[$nestedProp] -and $check.$nestedProp) {
-                    $nestedHtml += "<ul style='margin:6px 0 0 0;padding-left:18px;list-style:none'>"
-                    foreach ($nested in $check.$nestedProp) {
-                        $nestedIcon = switch ($nested.resultStatus) {
-                            "SUCCEEDED" { "<span style='color:#3fb950'>&#10004;</span>" }
-                            "FAILED"    { "<span style='color:#f85149'>&#10008;</span>" }
-                            "WARNING"   { "<span style='color:#d29922'>&#9888;</span>"  }
-                            default     { "<span style='color:#8b949e'>&#9679;</span>"  }
-                        }
-                        $nestedMsg = ""
-                        foreach ($mp in @("errorMessage","message","resultMessage")) {
-                            if ($nested.PSObject.Properties[$mp] -and $nested.$mp) {
-                                $nestedMsg = " <span style='color:#8b949e;font-size:0.8rem'>-- $([System.Web.HttpUtility]::HtmlEncode($nested.$mp))</span>"
-                                break
-                            }
-                        }
-                        $nestedHtml += "<li>$nestedIcon $([System.Web.HttpUtility]::HtmlEncode($nested.description))$nestedMsg</li>"
-                    }
-                    $nestedHtml += "</ul>"
-                }
-            }
-
+            $msgs    = Get-CheckMessages $check
             $msgHtml = if ($msgs.Count -gt 0) {
                 "<div style='margin-top:4px;color:#8b949e;font-size:0.8rem'>" + ($msgs -join "<br>") + "</div>"
             } else { "" }
-
-            $descCol = [System.Web.HttpUtility]::HtmlEncode($check.description) + $msgHtml + $nestedHtml
+            $nested  = Render-NestedChecks $check
+            $descCol = [System.Web.HttpUtility]::HtmlEncode($check.description) + $msgHtml + $nested
 
             $checkRows += "
         <tr class='$rowClass'>
@@ -489,14 +502,78 @@ function Write-ValidationReport {
         }
     }
 
-    # Host list rows
+    # ── Build per-host failure summary ─────────────────────────────────────
+    # Walk all checks and nested checks to collect failures keyed by host FQDN.
+    # SDDC Manager typically embeds the host FQDN in nested check descriptions
+    # or in a dedicated fqdn/hostname property on the nested check object.
+    $hostFailureMap = @{}  # FQDN -> list of failure strings
+    foreach ($h in $Hosts) { $hostFailureMap[$h.FQDN] = [System.Collections.Generic.List[string]]::new() }
+
+    function Collect-HostFailures ($obj, $depth) {
+        if ($depth -gt 4) { return }
+        foreach ($np in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
+            if ($obj.PSObject.Properties[$np] -and $obj.$np) {
+                foreach ($n in $obj.$np) {
+                    # Try to match this nested check to a host
+                    $matchedFqdn = $null
+                    # Check for explicit fqdn/hostname property
+                    foreach ($fp in @("fqdn","hostname","hostName","host")) {
+                        if ($n.PSObject.Properties[$fp] -and $n.$fp -and $hostFailureMap.ContainsKey($n.$fp)) {
+                            $matchedFqdn = $n.$fp; break
+                        }
+                    }
+                    # If no explicit property, check if description contains a known FQDN
+                    if (-not $matchedFqdn) {
+                        foreach ($fqdn in $hostFailureMap.Keys) {
+                            if ($n.description -and $n.description -like "*$fqdn*") {
+                                $matchedFqdn = $fqdn; break
+                            }
+                        }
+                    }
+                    if ($matchedFqdn -and $n.resultStatus -in @("FAILED","WARNING")) {
+                        $detail = $n.description
+                        foreach ($mp in @("errorMessage","message","resultMessage")) {
+                            if ($n.PSObject.Properties[$mp] -and $n.$mp) {
+                                $detail += " -- " + $n.$mp; break
+                            }
+                        }
+                        $hostFailureMap[$matchedFqdn].Add([System.Web.HttpUtility]::HtmlEncode($detail))
+                    }
+                    Collect-HostFailures $n ($depth + 1)
+                }
+                break
+            }
+        }
+    }
+
+    if ($ValidationStatus -and $ValidationStatus.PSObject.Properties["validationChecks"]) {
+        foreach ($check in $ValidationStatus.validationChecks) {
+            Collect-HostFailures $check 0
+        }
+    }
+
+    # Build per-host rows
     $hostRows = ""
     foreach ($h in $Hosts) {
+        $failures = $hostFailureMap[$h.FQDN]
+        $hostStatus = if ($failures -and $failures.Count -gt 0) {
+            "<span style='color:#f85149'>&#10008; Issues found</span>"
+        } else {
+            "<span style='color:#3fb950'>&#10004; No issues detected</span>"
+        }
+        $failureDetail = if ($failures -and $failures.Count -gt 0) {
+            "<ul style='margin:4px 0 0 0;padding-left:16px;color:#f85149;font-size:0.8rem'>" +
+            ($failures | ForEach-Object { "<li>$_</li>" }) -join "" +
+            "</ul>"
+        } else { "" }
+
+        $rowClass = if ($failures -and $failures.Count -gt 0) { "fail" } else { "ok" }
         $hostRows += "
-        <tr>
+        <tr class='$rowClass'>
             <td>$([System.Web.HttpUtility]::HtmlEncode($h.FQDN))</td>
-            <td style='font-family:Consolas,monospace;font-size:0.75rem;color:#79c0ff'>$([System.Web.HttpUtility]::HtmlEncode($h.Thumbprint))</td>
+            <td style='font-family:Consolas,monospace;font-size:0.72rem;color:#79c0ff;word-break:break-all'>$([System.Web.HttpUtility]::HtmlEncode($h.Thumbprint))</td>
             <td>$([System.Web.HttpUtility]::HtmlEncode($h.StorageType))</td>
+            <td>$hostStatus$failureDetail</td>
         </tr>"
     }
 
@@ -574,6 +651,21 @@ function Write-ValidationReport {
   <div><span>Validation ID: </span><strong><code style='font-size:0.8rem;color:#79c0ff'>$([System.Web.HttpUtility]::HtmlEncode($ValidationId))</code></strong></div>
 </div>
 
+<h2>Per-Host Summary</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Host FQDN</th>
+      <th>Thumbprint</th>
+      <th>Storage Type</th>
+      <th>Issues</th>
+    </tr>
+  </thead>
+  <tbody>
+    $hostRows
+  </tbody>
+</table>
+
 <h2>Validation Checks</h2>
 <table>
   <thead>
@@ -584,20 +676,6 @@ function Write-ValidationReport {
   </thead>
   <tbody>
     $checkRows
-  </tbody>
-</table>
-
-<h2>Hosts Validated</h2>
-<table>
-  <thead>
-    <tr>
-      <th>Host FQDN</th>
-      <th>Thumbprint</th>
-      <th>Storage Type</th>
-    </tr>
-  </thead>
-  <tbody>
-    $hostRows
   </tbody>
 </table>
 
@@ -614,7 +692,9 @@ function Write-ValidationReport {
 
     $html | Out-File -FilePath $Path -Encoding UTF8
     Write-Host ("  Validation report written to: {0}" -f $Path) -ForegroundColor Cyan
+    Start-Process $Path
 }
+
 
 
 function Write-CommissionCsv {
@@ -1287,6 +1367,7 @@ Write-CommissionReport -Data $summaryRows -Path $ReportPath `
     -SddcVersion $sddcVersion `
     -NetworkPool $selectedPool.name `
     -ScriptVersion $ScriptMeta.Version
+Start-Process $ReportPath
 
 Write-Host ("=" * 62) -ForegroundColor DarkCyan
 Write-Host ""
