@@ -73,7 +73,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 1.9.0
+    Version : 2.0.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -122,6 +122,12 @@
                 specific failure messages extracted from nested checks; nested
                 check rendering refactored into recursive helper functions;
                 all HTML reports auto-open in the default browser after writing
+        2.0.0 - Fixed failure message extraction for SDDC Manager VCF 9 API
+                response structure: error detail is in errorResponse.message
+                and host FQDN in errorResponse.context.fqdn, not in flat
+                properties; Get-CheckFqdn and Get-CheckMessages helpers updated;
+                Collect-HostFailures now matches top-level per-host check
+                entries directly; console output also shows errorResponse fields
 #>
 
 [CmdletBinding()]
@@ -158,7 +164,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "1.9.0"
+    Version = "2.0.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -433,6 +439,7 @@ function Write-ValidationReport {
     if ($failCount -gt 0) { $overallStatus = "FAILED" } elseif ($warnCount -gt 0) { $overallStatus = "WARNING" }
 
     # ── Helper: collect all messages from a check object ──────────────────
+    # Checks flat properties first, then errorResponse.message (SDDC Manager v9 structure)
     function Get-CheckMessages ($obj) {
         $list = [System.Collections.Generic.List[string]]::new()
         foreach ($p in @("errorMessage","message","resultMessage")) {
@@ -440,7 +447,32 @@ function Write-ValidationReport {
                 $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.$p))
             }
         }
+        # SDDC Manager VCF 9 nests the message under errorResponse.message
+        if ($obj.PSObject.Properties["errorResponse"] -and $obj.errorResponse) {
+            if ($obj.errorResponse.PSObject.Properties["message"] -and $obj.errorResponse.message) {
+                $list.Add([System.Web.HttpUtility]::HtmlEncode($obj.errorResponse.message))
+            }
+        }
         return $list
+    }
+
+    # ── Helper: extract FQDN from a check object ───────────────────────────
+    # Checks flat fqdn/hostname properties, then errorResponse.context.fqdn
+    function Get-CheckFqdn ($obj) {
+        foreach ($fp in @("fqdn","hostname","hostName","host")) {
+            if ($obj.PSObject.Properties[$fp] -and $obj.$fp) { return $obj.$fp }
+        }
+        # SDDC Manager VCF 9 puts the fqdn under errorResponse.context.fqdn
+        if ($obj.PSObject.Properties["errorResponse"] -and $obj.errorResponse) {
+            if ($obj.errorResponse.PSObject.Properties["context"] -and $obj.errorResponse.context) {
+                foreach ($fp in @("fqdn","hostname","hostName","host")) {
+                    if ($obj.errorResponse.context.PSObject.Properties[$fp] -and $obj.errorResponse.context.$fp) {
+                        return $obj.errorResponse.context.$fp
+                    }
+                }
+            }
+        }
+        return $null
     }
 
     # ── Helper: recursively render nested checks as HTML ──────────────────
@@ -511,34 +543,33 @@ function Write-ValidationReport {
 
     function Collect-HostFailures ($obj, $depth) {
         if ($depth -gt 4) { return }
+
+        # For VCF 9: top-level validationChecks have one entry per host.
+        # The check description is "Validating host <fqdn>" and errorResponse
+        # contains context.fqdn + message. Handle these directly first.
+        $directFqdn = Get-CheckFqdn $obj
+        if (-not $directFqdn) {
+            # Try matching description "Validating host <fqdn>"
+            foreach ($fqdn in $hostFailureMap.Keys) {
+                if ($obj.PSObject.Properties["description"] -and $obj.description -like "*$fqdn*") {
+                    $directFqdn = $fqdn; break
+                }
+            }
+        }
+        if ($directFqdn -and $hostFailureMap.ContainsKey($directFqdn) -and
+            $obj.PSObject.Properties["resultStatus"] -and
+            $obj.resultStatus -in @("FAILED","WARNING")) {
+            $msgs = Get-CheckMessages $obj
+            $detail = if ($msgs.Count -gt 0) { $msgs[0] } else { [System.Web.HttpUtility]::HtmlEncode($obj.description) }
+            if ($hostFailureMap[$directFqdn] -notcontains $detail) {
+                $hostFailureMap[$directFqdn].Add($detail)
+            }
+        }
+
+        # Recurse into nested check arrays
         foreach ($np in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
             if ($obj.PSObject.Properties[$np] -and $obj.$np) {
                 foreach ($n in $obj.$np) {
-                    # Try to match this nested check to a host
-                    $matchedFqdn = $null
-                    # Check for explicit fqdn/hostname property
-                    foreach ($fp in @("fqdn","hostname","hostName","host")) {
-                        if ($n.PSObject.Properties[$fp] -and $n.$fp -and $hostFailureMap.ContainsKey($n.$fp)) {
-                            $matchedFqdn = $n.$fp; break
-                        }
-                    }
-                    # If no explicit property, check if description contains a known FQDN
-                    if (-not $matchedFqdn) {
-                        foreach ($fqdn in $hostFailureMap.Keys) {
-                            if ($n.description -and $n.description -like "*$fqdn*") {
-                                $matchedFqdn = $fqdn; break
-                            }
-                        }
-                    }
-                    if ($matchedFqdn -and $n.resultStatus -in @("FAILED","WARNING")) {
-                        $detail = $n.description
-                        foreach ($mp in @("errorMessage","message","resultMessage")) {
-                            if ($n.PSObject.Properties[$mp] -and $n.$mp) {
-                                $detail += " -- " + $n.$mp; break
-                            }
-                        }
-                        $hostFailureMap[$matchedFqdn].Add([System.Web.HttpUtility]::HtmlEncode($detail))
-                    }
                     Collect-HostFailures $n ($depth + 1)
                 }
                 break
@@ -1105,11 +1136,23 @@ try {
             Write-Host ("    {0} {1}" -f $icon, $check.description) -ForegroundColor $checkColor
 
             # Print all available message properties on the check
-            foreach ($msgProp in @("errorMessage","message","resultMessage","description")) {
-                # skip description -- already printed above
-                if ($msgProp -eq "description") { continue }
+            foreach ($msgProp in @("errorMessage","message","resultMessage")) {
                 if ($check.PSObject.Properties[$msgProp] -and $check.$msgProp) {
                     Write-Host ("           {0}: {1}" -f $msgProp, $check.$msgProp) -ForegroundColor DarkGray
+                }
+            }
+            # VCF 9: error detail is under errorResponse.message, FQDN under errorResponse.context.fqdn
+            if ($check.PSObject.Properties["errorResponse"] -and $check.errorResponse) {
+                if ($check.errorResponse.PSObject.Properties["message"] -and $check.errorResponse.message) {
+                    Write-Host ("           errorResponse.message: {0}" -f $check.errorResponse.message) -ForegroundColor Red
+                }
+                if ($check.errorResponse.PSObject.Properties["context"] -and $check.errorResponse.context) {
+                    foreach ($fp in @("fqdn","hostname","hostName")) {
+                        if ($check.errorResponse.context.PSObject.Properties[$fp] -and $check.errorResponse.context.$fp) {
+                            Write-Host ("           errorResponse.context.{0}: {1}" -f $fp, $check.errorResponse.context.$fp) -ForegroundColor DarkGray
+                            break
+                        }
+                    }
                 }
             }
 
@@ -1133,6 +1176,11 @@ try {
                         foreach ($msgProp in @("errorMessage","message","resultMessage")) {
                             if ($nested.PSObject.Properties[$msgProp] -and $nested.$msgProp) {
                                 Write-Host ("             {0}: {1}" -f $msgProp, $nested.$msgProp) -ForegroundColor DarkGray
+                            }
+                        }
+                        if ($nested.PSObject.Properties["errorResponse"] -and $nested.errorResponse) {
+                            if ($nested.errorResponse.PSObject.Properties["message"] -and $nested.errorResponse.message) {
+                                Write-Host ("             errorResponse.message: {0}" -f $nested.errorResponse.message) -ForegroundColor Red
                             }
                         }
                         # One more level deep -- some SDDC Manager versions nest 3 levels
