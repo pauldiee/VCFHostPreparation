@@ -4,10 +4,10 @@ A pair of PowerShell scripts that automate ESXi host preparation and commissioni
 
 | Script | Purpose |
 |---|---|
-| `HostPrep.ps1` | Prepares ESXi hosts — DNS, NTP, certificates, advanced settings, password reset |
+| `HostPrep.ps1` | Prepares ESXi hosts — DNS, NTP, certificates, storage type detection, advanced settings, password reset |
 | `Commission-VCFHosts.ps1` | Commissions prepared hosts into SDDC Manager via the REST API |
 
-The typical workflow is: run `HostPrep.ps1` first, then hand off the generated CSV to `Commission-VCFHosts.ps1`.
+The typical workflow is: run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
 
 ![HostPrep console output](https://www.hollebollevsan.nl/wp-content/uploads/2026/03/HostPrep-Console-Screenshot.jpg)
 
@@ -20,16 +20,32 @@ The typical workflow is: run `HostPrep.ps1` first, then hand off the generated C
 For each host in your list, the script runs through the following steps in order:
 
 1. **DNS validation** — forward (A record) and reverse (PTR) lookup, flags mismatches before anything else runs
-2. **Connect** — connects directly to the ESXi host using the root account via PowerCLI
+2. **Connect** — connects directly to the host using the root account via PowerCLI
 3. **NTP** — verifies the required NTP servers are configured and that `ntpd` is running and set to start automatically
 4. **Advanced Settings** — sets `Config.HostAgent.ssl.keyStore.allowSelfSigned = true`, required by SDDC Manager
-5. **Optional Advanced Settings** — applies any extra settings you have enabled in the `$OptionalAdvancedSettings` block at the top of the script
-6. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not, it temporarily enables SSH, runs `/sbin/generate-certificates` via Posh-SSH, disables SSH again, then reboots the host and waits for it to come back online before continuing
-7. **Password reset** *(optional)* — resets the root account password to a new VCF 9 compliant value. Always runs last so the existing credential remains valid throughout
+5. **Optional Advanced Settings** — applies any extra settings enabled in the `$OptionalAdvancedSettings` block at the top of the script
+6. **Storage type detection** — detects the primary storage type for the commissioning CSV (see below)
+7. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not, temporarily enables SSH, runs `/sbin/generate-certificates` via Posh-SSH, disables SSH again, reboots, and waits for the host to come back online
+8. **Password reset** *(optional)* — resets the root password to a VCF 9 compliant value. Always runs last so the existing credential stays valid throughout
 
-After all hosts are processed, a colourised summary table is printed, a self-contained HTML report is saved next to the script, and a commissioning CSV is written for use by `Commission-VCFHosts.ps1`.
+After all hosts are processed:
+- A colourised summary table is printed to the console
+- A self-contained **HTML commissioning report** is saved next to the script
+- A **commissioning CSV** is saved for use by `Commission-VCFHosts.ps1`
 
 ![HostPrep HTML commissioning report](https://www.hollebollevsan.nl/wp-content/uploads/2026/03/HostPrep-Report-Screenshot.jpg)
+
+### Storage type detection
+
+After connecting to each host, `HostPrep.ps1` detects the storage type and writes it to the commissioning CSV:
+
+| Result | Condition |
+|---|---|
+| `VMFS_FC` | Fibre Channel HBA detected |
+| `NFS` | NFS datastore mounted |
+| `VSAN` | Default for all other hosts |
+
+> **vSAN OSA vs ESA cannot be auto-detected.** On a freshly prepped host about to be commissioned, disks are unclaimed — no disk groups or storage pools exist yet. The choice between OSA and ESA is a deployment design decision. If your hosts are intended for vSAN ESA, override the storage type to `VSAN_ESA` interactively in `Commission-VCFHosts.ps1` when prompted, or edit the CSV directly before running that script.
 
 ### Requirements
 
@@ -39,7 +55,7 @@ After all hosts are processed, a colourised summary table is printed, a self-con
 | VMware PowerCLI | `Install-Module -Name VMware.PowerCLI -Scope CurrentUser` |
 | Posh-SSH | Optional — needed for automated cert regeneration. `Install-Module -Name Posh-SSH -Scope CurrentUser` |
 
-**One-time PowerCLI setup** (run once per user account, then never again):
+**One-time PowerCLI setup** (run once per user account):
 
 ```powershell
 Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
@@ -77,14 +93,14 @@ Collect thumbprints and generate the HTML report and CSV without making any chan
 |---|---|---|---|
 | `-NtpServers` | `string[]` | `pool.ntp.org` | One or more NTP server addresses |
 | `-DryRun` | `switch` | — | Simulate all steps, no changes made |
-| `-WhatIfReport` | `switch` | — | Connect and collect thumbprints only, generate report and CSV |
+| `-WhatIfReport` | `switch` | — | Read thumbprints and generate report/CSV, no changes |
 | `-LogPath` | `string` | Desktop | Path for the transcript log file |
-| `-ReportPath` | `string` | Next to script | Path for the HTML report file |
-| `-CsvPath` | `string` | Next to script | Path for the commissioning CSV file |
+| `-ReportPath` | `string` | Next to script | Path for the HTML commissioning report |
+| `-CsvPath` | `string` | Next to script | Path for the commissioning CSV |
 
 ### Host list file
 
-The script prompts for the path to a plain text file with one FQDN per line. Lines starting with `#` are treated as comments and ignored.
+A plain text file with one FQDN per line. Lines starting with `#` are treated as comments and ignored.
 
 ```
 esxi01.vcf.lab
@@ -95,7 +111,7 @@ esxi04.vcf.lab
 
 ### HTML commissioning report
 
-The report is saved as `HostPrep_<timestamp>_Report.html` next to the script. For each host it shows:
+Saved as `HostPrep_<timestamp>_Report.html` next to the script. For each host it shows:
 
 - **SSL thumbprint** in `SHA256:<base64>` format (exactly as SDDC Manager expects) with a one-click copy button
 - **Certificate expiry** — highlighted amber within 90 days, red within 30
@@ -105,28 +121,28 @@ The report is saved as `HostPrep_<timestamp>_Report.html` next to the script. Fo
 
 ### Commissioning CSV
 
-After each run a CSV file is saved as `HostPrep_<timestamp>_Commissioning.csv` next to the script. It contains one row per host that connected successfully and has a valid thumbprint:
+Saved as `HostPrep_<timestamp>_Commissioning.csv`. One row per host that connected successfully:
 
 ```
 FQDN,Thumbprint,StorageType
 esxi01.vcf.lab,SHA256:abc123...,VSAN
-esxi02.vcf.lab,SHA256:def456...,VSAN
+esxi02.vcf.lab,SHA256:def456...,VMFS_FC
 ```
 
 This file is the input for `Commission-VCFHosts.ps1`.
 
 ### Optional Advanced Settings
 
-Near the top of the script there is an `$OptionalAdvancedSettings` block. Each entry is disabled by default — set `Enabled = $true` to apply it on every host.
+The `$OptionalAdvancedSettings` block near the top of the script contains extra settings, all disabled by default. Set `Enabled = $true` to apply on every host.
 
 | Setting | Description | Value type |
 |---|---|---|
 | `Config.HostAgent.plugins.hostsvc.esxAdminsGroup` | AD group whose members get full ESXi admin access | string |
 | `LSOM.lsomEnableRebuildOnLSE` | Enables automatic vSAN rebuild when a device is flagged as LSE | integer (1/0) |
-| `DataMover.HardwareAcceleratedMove` | Enables SSD TRIM — ESXi issues UNMAP commands to compatible SSDs | integer (1/0) |
-| `DataMover.HardwareAcceleratedInit` | Enables SSD TRIM — ESXi issues UNMAP commands to compatible SSDs | integer (1/0) |
+| `DataMover.HardwareAcceleratedMove` | Enables SSD TRIM — ESXi issues UNMAP to compatible SSDs | integer (1/0) |
+| `DataMover.HardwareAcceleratedInit` | Enables SSD TRIM — ESXi issues UNMAP to compatible SSDs | integer (1/0) |
 
-> **Note:** Re-running the script with a different `esxAdminsGroup` value will overwrite the setting on all hosts. Verify the group name before enabling.
+> Re-running with a different `esxAdminsGroup` value will overwrite the setting. Verify the group name before enabling across a full deployment.
 
 ### DNS validation
 
@@ -137,16 +153,7 @@ Near the top of the script there is an `$OptionalAdvancedSettings` block. Each e
 | `WARN: No PTR record` | A record resolves but no PTR exists |
 | `FAILED` | Forward lookup failed entirely |
 
-DNS issues are flagged but do not block the remaining preparation steps. Fix any warnings before commissioning.
-
-### Summary table colours
-
-| Colour | Meaning |
-|---|---|
-| 🟢 Green | OK |
-| 🔴 Red | FAILED or Timeout |
-| ⬜ Dark gray | Skipped |
-| 🟡 Yellow | Manual action required, Partial, or Warning |
+DNS issues are flagged but do not block the remaining preparation steps. Fix any warnings before commissioning — SDDC Manager requires correct forward and reverse DNS.
 
 ### VCF 9 password requirements
 
@@ -172,33 +179,89 @@ Reads the CSV produced by `HostPrep.ps1` and commissions all hosts into SDDC Man
 
 ### What it does
 
-1. Reads the commissioning CSV (FQDN, thumbprint, storage type)
+1. Reads the commissioning CSV — FQDN, thumbprint, and detected storage type per host
 2. Prompts for SDDC Manager FQDN, username and password
-3. Authenticates and retrieves a Bearer token
-4. Detects the SDDC Manager version
-5. Retrieves available network pools and prompts for selection
-6. Confirms or overrides the storage type from the CSV
-7. Prompts for the ESXi root password (required by SDDC Manager)
-8. Validates hosts via `POST /v1/hosts/validations` — aborts with a per-check error breakdown if validation fails
-9. Commissions hosts via `POST /v1/hosts`
-10. Polls the task every 15 seconds until `SUCCESSFUL`, `FAILED`, or timeout
-11. Prints a colourised per-host result summary with task ID and SDDC Manager link
+3. Authenticates and retrieves a Bearer token, detects SDDC Manager version
+4. Retrieves available network pools and prompts for selection
+5. Shows the detected storage type per host with an interactive override prompt — confirm or change per host before commissioning. Override `VSAN` to `VSAN_ESA` here if ESA is intended
+6. Prompts for the ESXi root password (required by SDDC Manager)
+7. Validates hosts via `POST /v1/hosts/validations` — prints every check with PASS/FAIL/WARN icons, aborts on failure
+8. Commissions hosts via `POST /v1/hosts`
+9. Polls the task every 15 seconds until `SUCCESSFUL`, `FAILED`, or timeout
+10. Queries `GET /v1/hosts` to retrieve the SDDC Manager host UUID for each commissioned host
+11. Prints a colourised per-host summary table with host UUIDs
+12. Writes a **results CSV** and a **dark-mode HTML report** next to the script
+
+### Storage type override
+
+At step 5 you are shown the storage type that `HostPrep.ps1` detected for each host, and given the opportunity to override it:
+
+```
+  esxi01.vcf.lab                           Detected: VSAN
+    Press Enter to accept 'VSAN', or type a different storage type: VSAN_ESA
+    Using: VSAN_ESA
+
+  esxi02.vcf.lab                           Detected: VMFS_FC
+    Press Enter to accept 'VMFS_FC', or type a different storage type:
+    Using: VMFS_FC
+```
+
+Valid values: `VSAN`, `VSAN_ESA`, `NFS`, `VMFS_FC`, `VVOL`
+
+### Output files
+
+After commissioning completes, two files are written next to the script:
+
+- `Commission_<timestamp>_Results.csv` — per-host results including SDDC Manager host UUID, storage type, network pool, task ID, and timestamp
+- `Commission_<timestamp>_Report.html` — dark-mode HTML report with host UUIDs, storage types, network pool, task ID, and per-host status
+
+### -ValidateOnly mode
+
+Run validation without commissioning anything:
+
+```powershell
+.\Commission-VCFHosts.ps1 -ValidateOnly
+```
+
+Goes through all setup steps then calls `POST /v1/hosts/validations`, prints every check with icons, and exits cleanly:
+
+```
+  Validation results:
+    [PASS] Certificate thumbprint check
+    [PASS] DNS forward lookup
+    [WARN] NTP configuration
+    [FAIL] Network connectivity check
+
+  VALIDATION SUMMARY
+  Hosts checked  : 4
+  Checks passed  : 11
+  Checks warned  : 1
+  Checks failed  : 1
+
+  No hosts were commissioned. Run without -ValidateOnly to proceed.
+```
 
 ### Usage
 
-Run interactively — all prompts are handled at runtime:
+Interactive run — all prompts at runtime:
 
 ```powershell
 .\Commission-VCFHosts.ps1
 ```
 
-Pass the CSV path and SDDC Manager FQDN directly:
+Pass CSV path and SDDC Manager FQDN directly:
 
 ```powershell
 .\Commission-VCFHosts.ps1 -CsvPath "C:\VCF\HostPrep_20260320_Commissioning.csv" -SddcManager sddc-manager.vcf.lab
 ```
 
-In lab environments with self-signed certificates on SDDC Manager:
+Validate only, no commissioning:
+
+```powershell
+.\Commission-VCFHosts.ps1 -ValidateOnly
+```
+
+Lab environment with self-signed certificate on SDDC Manager:
 
 ```powershell
 .\Commission-VCFHosts.ps1 -SkipCertificateCheck
@@ -210,12 +273,15 @@ In lab environments with self-signed certificates on SDDC Manager:
 |---|---|---|---|
 | `-CsvPath` | `string` | Prompted | Path to the HostPrep commissioning CSV |
 | `-SddcManager` | `string` | Prompted | FQDN of the SDDC Manager appliance |
-| `-TimeoutMinutes` | `int` | `30` | Maximum minutes to wait for the task to complete |
-| `-SkipCertificateCheck` | `switch` | — | Ignore TLS errors — useful for lab environments |
+| `-TimeoutMinutes` | `int` | `30` | Maximum minutes to wait for the task |
+| `-ValidateOnly` | `switch` | — | Run validation only, do not commission |
+| `-SkipCertificateCheck` | `switch` | — | Ignore TLS errors — for lab use |
+| `-ReportPath` | `string` | Next to script | Path for the HTML report |
+| `-OutputCsvPath` | `string` | Next to script | Path for the results CSV |
 
 ### Requirements
 
-No additional modules required beyond standard PowerShell 5.1. All API calls use `Invoke-RestMethod`.
+No additional modules required beyond PowerShell 5.1. All API calls use `Invoke-RestMethod`.
 
 ---
 

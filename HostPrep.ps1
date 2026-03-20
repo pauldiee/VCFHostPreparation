@@ -3,81 +3,81 @@
     Prepares ESXi hosts for commissioning into SDDC Manager / VCF 9.
 
 .DESCRIPTION
-    When run, the script will interactively prompt for all required input  -- 
-    no pre-configuration needed. The following steps are performed for each host:
+    Reads a plain text file containing one ESXi host FQDN per line and runs
+    through the following steps on each host:
 
-      1. Validate DNS  --  forward (A record) and reverse (PTR) lookup
-      2. Connect to the ESXi host using the root account
-      3. Ensure NTP servers are configured and the NTP service is running
-      4. Apply the required SDDC Manager advanced setting (allowSelfSigned)
-      5. Apply any enabled optional advanced settings
-      6. Check if the certificate CN matches the host FQDN; if not, enable
-         SSH temporarily, regenerate the certificate via
-         /sbin/generate-certificates, disable SSH again, then reboot and
-         wait for the host to return online
-      7. Optionally reset the root account password (asked interactively)
+      1. DNS validation  --  forward (A record) and reverse (PTR) lookup
+      2. Connect to the host using the root account via PowerCLI
+      3. NTP  --  verify NTP servers are configured and ntpd is running
+      4. Advanced Settings  --  set allowSelfSigned = true (required by SDDC Manager)
+      5. Optional Advanced Settings  --  apply any settings enabled in the
+         $OptionalAdvancedSettings block at the top of the script
+      6. Storage type detection  --  detect VMFS_FC (FC HBA present) or NFS
+         (NFS datastore mounted); defaults to VSAN otherwise. Note: vSAN OSA
+         vs ESA cannot be auto-detected on unclaimed hosts -- override to
+         VSAN_ESA in Commission-VCFHosts.ps1 if ESA is intended
+      7. Certificate regeneration  --  check CN vs FQDN; if mismatched, enable
+         SSH temporarily, run /sbin/generate-certificates via Posh-SSH, disable
+         SSH, reboot, and wait for the host to return online
+      8. Password reset (optional)  --  reset root password to a VCF 9 compliant
+         value; always runs last so the existing credential is valid throughout
 
-    After all hosts are processed, an HTML commissioning report and a CSV
-    file are generated next to the script. The HTML report contains the
-    SHA256:<base64> thumbprint for each host ready to paste into SDDC Manager.
-    The CSV is consumed by the companion Commission-VCFHosts.ps1 script to
-    automate the commissioning step.
+    After all hosts are processed:
+      - A colourised summary table is printed to the console
+      - An HTML commissioning report is saved next to the script containing the
+        SHA256:<base64> thumbprint for each host (ready to paste into SDDC Manager)
+      - A commissioning CSV is saved next to the script for use by the companion
+        script Commission-VCFHosts.ps1 to automate the SDDC Manager commissioning step
+
+    Storage Type Detection
+    ----------------------
+    The storage type per host is detected automatically after connecting:
+      - VMFS_FC   : Fibre Channel HBA detected
+      - NFS       : NFS datastore mounted
+      - VSAN      : default for all other hosts (unclaimed disks)
+
+    vSAN OSA vs ESA cannot be distinguished on a freshly prepped host because
+    disks are unclaimed at commissioning time. If ESA is intended, override the
+    storage type interactively in Commission-VCFHosts.ps1 or edit the CSV.
 
     Optional Advanced Settings
     --------------------------
-    A configuration hashtable near the top of the script ($OptionalAdvancedSettings)
-    contains additional advanced settings that are disabled by default. To enable
-    any of them, set Enabled = $true and adjust the Value if needed. Currently
-    available optional settings:
+    Near the top of the script, the $OptionalAdvancedSettings block contains
+    extra settings that are disabled by default. Set Enabled = $true to apply:
 
-      - Config.HostAgent.plugins.hostsvc.esxAdminsGroup
-          The Active Directory group whose members receive full admin access.
-          Default value: "ESX Admins"  --  change to match your AD group name.
+      - Config.HostAgent.plugins.hostsvc.esxAdminsGroup (string)
+          AD group whose members receive full ESXi admin access.
+          Default: "ESX Admins"  --  change to match your AD group name.
 
-      - LSOM.lsomEnableRebuildOnLSE
+      - LSOM.lsomEnableRebuildOnLSE (integer, 1/0)
           Enables vSAN automatic rebuild when a device is flagged as LSE.
 
-      - DataMover.HardwareAcceleratedMove / HardwareAcceleratedInit
-          Enables SSD TRIM support so ESXi issues UNMAP commands to compatible
-          SSDs, allowing drive firmware to reclaim freed blocks.
+      - DataMover.HardwareAcceleratedMove / HardwareAcceleratedInit (integer, 1/0)
+          Enables SSD TRIM so ESXi issues UNMAP commands to compatible SSDs.
 
-    Host List File (.txt)
-    ---------------------
-    The script will prompt for the full path to a plain text file containing
-    one ESXi host FQDN per line. Example file contents:
-
-        esxi01.vcf.lab
-        esxi02.vcf.lab
-        esxi03.vcf.lab
-
-    Lines starting with # are treated as comments and ignored.
-    Blank lines are also ignored.
-    The path can be typed or pasted  --  surrounding quotes are stripped automatically.
+    Host List File
+    --------------
+    A plain text file with one ESXi FQDN per line. Lines starting with # are
+    treated as comments and ignored. Surrounding quotes on the path are stripped
+    automatically when pasted.
 
     Prerequisites
     -------------
-    One-time PowerCLI setup (run once per user account, then never again):
+    One-time PowerCLI setup (run once per user account):
 
         Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
 
-    This permanently suppresses the VMware CEIP warning that PowerCLI emits
-    on first use. Without it the warning will appear every time a new terminal
-    is opened, and no script can suppress it reliably from within.
-
-    The Posh-SSH PowerShell module is optional but recommended. Without it,
-    certificate regeneration will be skipped and must be performed manually
-    on each host. To install it, run:
+    Posh-SSH is optional but required for automated certificate regeneration:
 
         Install-Module -Name Posh-SSH -Scope CurrentUser
 
-    If Posh-SSH is not available, the script will print per-host instructions
-    at runtime telling you to run /sbin/generate-certificates followed by a
-    reboot of the host.
+    Without Posh-SSH the script will print per-host manual instructions for
+    the certificate step instead of failing.
 
-    Password Requirements (VCF 9)
-    ------------------------------
-    If a password reset is requested, the new password is validated against
-    VCF 9 requirements before any host is contacted:
+    VCF 9 Password Requirements
+    ---------------------------
+    If a password reset is requested the new password is validated before any
+    host is touched:
       - 15 to 40 characters
       - At least 1 lowercase letter
       - At least 1 uppercase letter (not as the first character)
@@ -90,24 +90,24 @@
     One or more NTP server addresses. Defaults to 'pool.ntp.org'.
 
 .PARAMETER LogPath
-    Path to write a transcript log. Defaults to the Desktop.
+    Path to write the transcript log. Defaults to the Desktop.
 
 .PARAMETER DryRun
-    If set, no changes are made to any host. All actions are logged as
-    [DRY RUN] so you can validate the script flow without a real ESXi host.
-    Credentials and the host list are still prompted but never used.
+    Simulates all steps without making any changes. All actions are logged
+    as [DRY RUN]. Useful for validating the script against your environment.
 
 .PARAMETER WhatIfReport
-    Connects to each host, reads the current certificate CN and SHA-256
-    thumbprint, and generates the HTML report  --  without making any other
-    changes. Useful for a pre-commissioning inventory pass to collect
-    thumbprints before running the full script. Credentials are still
-    required to connect.
+    Connects to each host, reads the certificate CN, thumbprint and expiry,
+    then generates the HTML report and CSV without making any changes.
+    Useful for a pre-commissioning inventory pass to collect thumbprints.
+
+.PARAMETER ReportPath
+    Path for the HTML commissioning report. Defaults to the script folder
+    with a timestamp filename: HostPrep_<timestamp>_Report.html.
 
 .PARAMETER CsvPath
-    Path to write the commissioning CSV file. Defaults to the same folder
-    as the script. The CSV is consumed by Commission-VCFHosts.ps1 and
-    contains one row per host with FQDN, thumbprint, and storage type.
+    Path for the commissioning CSV consumed by Commission-VCFHosts.ps1.
+    Defaults to the script folder: HostPrep_<timestamp>_Commissioning.csv.
 
 .EXAMPLE
     .\HostPrep.ps1
@@ -196,16 +196,17 @@
         3.4.0 - Added Test-DNSResolution: forward A record and reverse PTR
                 check per host before connect; DNS column in summary table
                 and HTML report; WARN for PTR issues, FAILED for no A record
-        3.6.0 - Added Get-ESXiStorageType helper: detects primary storage
-                type per host (VMFS_FC, NFS, VSAN_ESA, VSAN) via FC HBA
-                check, NFS datastore check, and vSAN disk group check;
-                detected type stored in $hostResult.StorageType and
-                written to the commissioning CSV per host
         3.5.0 - Added commissioning CSV export (HostPrep_<timestamp>_
                 Commissioning.csv) with FQDN, thumbprint and storage type
                 for hosts that connected successfully; added -CsvPath
                 parameter; companion script Commission-VCFHosts.ps1 reads
                 this CSV to automate the SDDC Manager commissioning step
+        3.6.0 - Added Get-ESXiStorageType helper: detects VMFS_FC (FC HBA
+                present) and NFS (NFS datastore mounted); defaults to VSAN
+                for all other hosts; vSAN OSA vs ESA is not auto-detectable
+                on unclaimed hosts and must be overridden manually in
+                Commission-VCFHosts.ps1; detected type written per-host
+                to the commissioning CSV
 #>
 
 [CmdletBinding()]
@@ -824,16 +825,21 @@ function Get-ESXiStorageType {
         in the VCF commissioning CSV.
 
     .DESCRIPTION
-        Checks in order: FC HBAs, NFS datastores, vSAN ESA disk groups,
-        vSAN disk groups. Returns the first match as the SDDC Manager
-        storageType value. Falls back to VSAN if nothing is detected.
+        Checks in order: FC HBAs, NFS datastores, then defaults to VSAN.
+
+        vSAN OSA vs ESA cannot be reliably auto-detected on a freshly prepped
+        host because disks are unclaimed at commissioning time -- there are no
+        disk groups or storage pools yet. The distinction is a deployment design
+        choice, not a readable hardware state. If your hosts are intended for
+        vSAN ESA, override the storage type interactively in Commission-VCFHosts.ps1
+        when prompted, or edit the CSV directly before running that script.
 
         Valid SDDC Manager storageType values:
-          VSAN       - vSAN (OSA, original storage architecture)
-          VSAN_ESA   - vSAN Express Storage Architecture
-          NFS        - NFS datastore
-          VMFS_FC    - VMFS on Fibre Channel
-          VVOL       - Virtual Volumes (not auto-detected, set manually)
+          VSAN       - vSAN Original Storage Architecture (OSA)  [default]
+          VSAN_ESA   - vSAN Express Storage Architecture -- set manually
+          NFS        - NFS datastore                            -- auto-detected
+          VMFS_FC    - VMFS on Fibre Channel                    -- auto-detected
+          VVOL       - Virtual Volumes                          -- set manually
 
     .PARAMETER VMHostObj
         VMHost object returned by Get-VMHost.
@@ -858,25 +864,9 @@ function Get-ESXiStorageType {
             return "NFS"
         }
 
-        # vSAN ESA check -- ESA uses a flat storage pool, no traditional disk groups
-        try {
-            $esxcli   = Get-EsxCli -VMHost $VMHostObj -V2 -ErrorAction SilentlyContinue
-            $vsanInfo = $esxcli.vsan.storage.list.Invoke()
-            if ($vsanInfo | Where-Object { $_.PSObject.Properties["PoolType"] -and $_.PoolType -eq "singleTier" }) {
-                Write-Host "  Storage type detected : VSAN_ESA (vSAN ESA storage pool)" -ForegroundColor DarkGray
-                return "VSAN_ESA"
-            }
-        } catch { }
-
-        # vSAN OSA check -- traditional disk groups
-        $vsanDgs = Get-VsanDiskGroup -VMHost $VMHostObj -ErrorAction SilentlyContinue
-        if ($vsanDgs -and @($vsanDgs).Count -gt 0) {
-            Write-Host "  Storage type detected : VSAN (vSAN disk group present)" -ForegroundColor DarkGray
-            return "VSAN"
-        }
-
-        # No definitive storage found -- default to VSAN for new VCF deployments
-        Write-Host "  Storage type detected : VSAN (default -- no specific storage detected)" -ForegroundColor DarkGray
+        # Default -- vSAN hosts have unclaimed disks at commissioning time;
+        # OSA vs ESA is a design choice and must be set manually if ESA is intended.
+        Write-Host "  Storage type detected : VSAN (default -- override to VSAN_ESA in Commission-VCFHosts.ps1 if needed)" -ForegroundColor DarkGray
         return "VSAN"
 
     } catch {

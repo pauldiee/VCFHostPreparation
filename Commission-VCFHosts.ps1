@@ -79,23 +79,23 @@
     Date    : 2026-03-20
 
     Changelog:
-        1.4.0 - Storage type is now per-host from the CSV (detected by
-                HostPrep.ps1); interactive per-host override prompt at
-                runtime replaces the single batch-level storage prompt
-        1.3.0 - Added HTML dark-mode commissioning report and results CSV
-                after each run; -ReportPath and -OutputCsvPath parameters
-                added; Write-CommissionReport and Write-CommissionCsv
-                helper functions added
+        1.0.0 - Initial release. Reads HostPrep CSV, authenticates to SDDC Manager,
+                retrieves network pools, validates and commissions hosts, polls task
+                to completion and prints colourised result summary.
+        1.1.0 - After task completion, query GET /v1/hosts to retrieve
+                SDDC Manager host UUIDs per commissioned host; HostID
+                column added to summary table and printed in footer
         1.2.0 - Added -ValidateOnly switch: runs POST /v1/hosts/validations
                 and prints a full per-check breakdown per host without
                 commissioning; validation results now always printed with
                 pass/fail/warn icons regardless of mode
-        1.1.0 - After task completion, query GET /v1/hosts to retrieve
-                SDDC Manager host UUIDs per commissioned host; HostID
-                column added to summary table and printed in footer
-        1.0.0 - Initial release. Reads HostPrep CSV, authenticates to SDDC Manager,
-                retrieves network pools, validates and commissions hosts, polls task
-                to completion and prints colourised result summary.
+        1.3.0 - Added HTML dark-mode commissioning report and results CSV
+                after each run; -ReportPath and -OutputCsvPath parameters
+                added; Write-CommissionReport and Write-CommissionCsv
+                helper functions added
+        1.4.0 - Storage type is now per-host from the CSV (detected by
+                HostPrep.ps1); interactive per-host override prompt at
+                runtime replaces the single batch-level storage prompt
 #>
 
 [CmdletBinding()]
