@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 3.0.0
+    Version : 3.0.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -219,6 +219,10 @@
                 List[string] indexing behaviour; passing hosts now show PASS
                 badge only with no extra detail; FAIL rows still show the full
                 error message
+        3.0.1 - Gated ICertificatePolicy Add-Type block behind PS version check
+                (Major -lt 6); ICertificatePolicy was removed in .NET 6 and
+                caused a CS0246 compile error on PowerShell 7+; PS 6+ already
+                uses -SkipCertificateCheck per Invoke-RestMethod call
         3.0.0 - Added TLS certificate bypass for SDDC Manager self-signed/
                 internal CA certs: PS 5.1 uses TrustAllCertsPolicy + TLS 1.2;
                 PS 6+ uses -SkipCertificateCheck on Invoke-RestMethod; fixed
@@ -262,7 +266,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "3.0.0"
+    Version = "3.0.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -273,9 +277,11 @@ $ScriptMeta = @{
 #region --- Initialisation ---
 
 # SDDC Manager uses a self-signed/internal CA cert — bypass TLS validation unconditionally.
-# PS 5.1: override the global certificate policy.
-if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
-    Add-Type @"
+# PS 5.1: ICertificatePolicy global override (ICertificatePolicy removed in .NET 6).
+# PS 6+:  -SkipCertificateCheck is added per Invoke-RestMethod call below.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
+        Add-Type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAllCerts : ICertificatePolicy {
@@ -283,9 +289,10 @@ public class TrustAllCerts : ICertificatePolicy {
         WebRequest req, int problem) { return true; }
 }
 "@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
+    [System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 }
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
-[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 
 # Required for HTML entity encoding in the commissioning report
 Add-Type -AssemblyName System.Web
