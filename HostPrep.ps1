@@ -126,7 +126,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.1
+    Version : 3.7.2
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -221,6 +221,11 @@
                 before connecting; SSH key exchange failures now produce a
                 specific error message directing the user to Update-Module
                 Posh-SSH and noting ESXi FIPS mode as a potential cause
+        3.7.2 - Fixed reboot not executing after certificate regeneration:
+                removed unnecessary Disconnect-VIServer/Connect-VIServer
+                before Restart-VMHost; the new certificate only takes effect
+                after reboot so the existing session is still valid and the
+                reconnect was silently failing, swallowing the reboot call
 #>
 
 [CmdletBinding()]
@@ -251,7 +256,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.1"
+    Version = "3.7.2"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -1544,14 +1549,10 @@ foreach ($esxiHost in $targetEsxiHosts) {
                     if ($certRegenSuccess) {
                         $hostResult.CertRegen = "OK"
 
-                        # Disconnect cleanly before reboot
-                        Disconnect-VIServer -Server $esxiHost -Confirm:$false -ErrorAction SilentlyContinue
-                        Write-Log "  Disconnected. Initiating reboot of $esxiHost..." -Level WARN
-
-                        # Reconnect temporarily to issue the reboot command
-                        Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
-                        $rebootHostObj = Get-VMHost -Name $esxiHost -ErrorAction Stop
-                        Restart-VMHost -VMHost $rebootHostObj -Confirm:$false -Force -ErrorAction Stop | Out-Null
+                        # Issue reboot using the existing connection -- the new certificate
+                        # only takes effect after the reboot, so the current session is still valid.
+                        Write-Log "  Initiating reboot of $esxiHost..." -Level WARN
+                        Restart-VMHost -VMHost $vmHostObj -Confirm:$false -Force -ErrorAction Stop | Out-Null
                         Disconnect-VIServer -Server $esxiHost -Confirm:$false -ErrorAction SilentlyContinue
                         Write-Log "  Reboot issued. Waiting for host to come back online..." -Level WARN
 
