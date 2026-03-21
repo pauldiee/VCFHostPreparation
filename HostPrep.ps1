@@ -244,7 +244,7 @@ $ScriptMeta = @{
     Version = "3.6.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-03-19"
+    Date    = "2026-03-20"
 }
 
 #endregion
@@ -334,6 +334,12 @@ if ($WhatIfReport) {
     Write-Host "  then generates the HTML report. No changes will be made." -ForegroundColor DarkGray
     Write-Host ("  " + $ScriptMeta.Blog) -ForegroundColor DarkGray
     Write-Host ""
+}
+
+# Mutual exclusion guard -- only one mode at a time
+if ($DryRun -and $WhatIfReport) {
+    Write-Host "  ERROR: -DryRun and -WhatIfReport are mutually exclusive. Specify one at a time." -ForegroundColor Red
+    exit 1
 }
 
 # Start transcript for audit logging
@@ -940,7 +946,8 @@ function Write-ColorSummaryTable {
 function Write-HtmlReport {
     param (
         [System.Collections.Generic.List[PSCustomObject]]$Data,
-        [string]$ReportPath
+        [string]$ReportPath,
+        [switch]$WhatIfReport
     )
 
     $totalCount   = [int]$Data.Count
@@ -1146,6 +1153,41 @@ function copyThumb(btn) {
 }
 
 #endregion
+#region --- Host List Selection ---
+
+$hostFilePath = $null
+while (-not $hostFilePath) {
+    $raw = (Read-Host "  Enter full path to the host list .txt file").Trim()
+
+    # Strip surrounding quotes that Windows sometimes adds when copy-pasting paths
+    $raw = $raw.Trim('"').Trim("'")
+
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        Write-Host "  Path cannot be empty. Please try again." -ForegroundColor Yellow
+        continue
+    }
+
+    if (-not (Test-Path -LiteralPath $raw -PathType Leaf)) {
+        Write-Host "  File not found: '$raw'" -ForegroundColor Yellow
+        Write-Host "  Please check the path and try again." -ForegroundColor Yellow
+        continue
+    }
+
+    $hostFilePath = $raw
+}
+
+$targetEsxiHosts = Get-Content -LiteralPath $hostFilePath |
+    Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' }
+
+if (-not $targetEsxiHosts) {
+    Write-Warning "Host list is empty. Exiting."
+    Stop-Transcript
+    exit 1
+}
+
+Write-Host "  Loaded $($targetEsxiHosts.Count) host(s) from: $hostFilePath" -ForegroundColor Cyan
+
+#endregion
 #region --- Credential Gathering ---
 
 Write-Host "`nGathering credentials..." -ForegroundColor Cyan
@@ -1242,41 +1284,6 @@ if ($ResetPassword) {
 Write-Host ""
 
 #endregion
-#region --- Host List Selection ---
-
-$hostFilePath = $null
-while (-not $hostFilePath) {
-    $raw = (Read-Host "  Enter full path to the host list .txt file").Trim()
-
-    # Strip surrounding quotes that Windows sometimes adds when copy-pasting paths
-    $raw = $raw.Trim('"').Trim("'")
-
-    if ([string]::IsNullOrWhiteSpace($raw)) {
-        Write-Host "  Path cannot be empty. Please try again." -ForegroundColor Yellow
-        continue
-    }
-
-    if (-not (Test-Path -LiteralPath $raw -PathType Leaf)) {
-        Write-Host "  File not found: '$raw'" -ForegroundColor Yellow
-        Write-Host "  Please check the path and try again." -ForegroundColor Yellow
-        continue
-    }
-
-    $hostFilePath = $raw
-}
-
-$targetEsxiHosts = Get-Content -LiteralPath $hostFilePath |
-    Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' }
-
-if (-not $targetEsxiHosts) {
-    Write-Warning "Host list is empty. Exiting."
-    Stop-Transcript
-    exit 1
-}
-
-Write-Host "  Loaded $($targetEsxiHosts.Count) host(s) from: $hostFilePath" -ForegroundColor Cyan
-
-#endregion
 #region --- Per-Host Processing ---
 
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -1322,6 +1329,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
             } elseif ($dnsCheck.Status -eq "FAILED") {
                 Write-Host "  Forward lookup failed for $esxiHost." -ForegroundColor Red
                 Write-Host "  ACTION REQUIRED: Ensure an A record exists for this host." -ForegroundColor Red
+                throw "DNS A record lookup failed for $esxiHost. Fix DNS before commissioning."
             } else {
                 Write-Host "  Forward : $($dnsCheck.Forward)" -ForegroundColor Yellow
                 Write-Host "  Reverse : $($dnsCheck.Reverse)" -ForegroundColor Yellow
@@ -1334,7 +1342,8 @@ foreach ($esxiHost in $targetEsxiHosts) {
         Write-Host "`n  [Connect]" -ForegroundColor Cyan
         if ($DryRun) {
             Write-Host "`n  [DRY RUN] Would connect to $esxiHost as 'root'." -ForegroundColor DarkYellow
-            $hostResult.Connected = $true
+            $hostResult.Connected   = $true
+            $hostResult.StorageType = "Skipped"
         } else {
             Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
             $hostResult.Connected = $true
@@ -1441,13 +1450,8 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 Write-Host "  [DRY RUN] Would reboot host and wait for it to come back online." -ForegroundColor DarkYellow
                 $hostResult.CertRegen = "OK"
                 $hostResult.Rebooted  = "OK"
-            } elseif (-not $script:PoshSSHAvailable) {
-                Write-Host "  Posh-SSH not available. Certificate regeneration skipped." -ForegroundColor Yellow
-                Write-Host "  ACTION REQUIRED: Manually run on this host and then reboot:" -ForegroundColor Yellow
-                Write-Host "    /sbin/generate-certificates" -ForegroundColor Cyan
-                $hostResult.CertRegen = "Manual"
-                $hostResult.Rebooted  = "Manual"
             } else {
+                # Always read cert thumbprint and expiry -- no Posh-SSH required
                 $certCheck = Test-ESXiCertificateNeedsRegen -VMHost $esxiHost
                 $hostResult.Thumbprint = $certCheck.Thumbprint
                 $hostResult.Expiry     = $certCheck.Expiry
@@ -1455,6 +1459,12 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 if (-not $certCheck.NeedsRegen) {
                     $hostResult.CertRegen = "Skipped"
                     $hostResult.Rebooted  = "Skipped"
+                } elseif (-not $script:PoshSSHAvailable) {
+                    Write-Host "  Posh-SSH not available. Certificate regeneration skipped." -ForegroundColor Yellow
+                    Write-Host "  ACTION REQUIRED: Manually run on this host and then reboot:" -ForegroundColor Yellow
+                    Write-Host "    /sbin/generate-certificates" -ForegroundColor Cyan
+                    $hostResult.CertRegen = "Manual"
+                    $hostResult.Rebooted  = "Manual"
                 } else {
                     $certRegenSuccess = Invoke-ESXiCertificateRegen `
                         -VMHost     $esxiHost `
@@ -1583,7 +1593,7 @@ Write-Host "Warning"               -ForegroundColor Yellow
 Write-Host ""
 Write-Host ("  Log written to    : {0}" -f $LogPath) -ForegroundColor DarkGray
 
-Write-HtmlReport -Data $results -ReportPath $ReportPath
+Write-HtmlReport -Data $results -ReportPath $ReportPath -WhatIfReport:$WhatIfReport
 
 # Export commissioning CSV for use by Commission-VCFHosts.ps1
 # Only includes hosts that connected successfully and have a valid thumbprint

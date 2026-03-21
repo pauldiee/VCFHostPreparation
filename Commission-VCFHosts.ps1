@@ -507,6 +507,7 @@ function Get-AllLeafChecks {
             if ($c.PSObject.Properties[$np] -and $c.$np -and @($c.$np).Count -gt 0) {
                 $hasNested = $true
                 foreach ($n in (Get-AllLeafChecks $c.$np)) { $result.Add($n) }
+                break  # only recurse into the first matching nested property per check
             }
         }
         if (-not $hasNested) { $result.Add($c) }
@@ -1165,9 +1166,9 @@ Write-Host ""
 
 $poolIndex = $null
 while ($null -eq $poolIndex) {
-    $input = Read-Host "  Select network pool number"
-    if ($input -match '^\d+$') {
-        $idx = [int]$input - 1
+    $poolSelection = Read-Host "  Select network pool number"
+    if ($poolSelection -match '^\d+$') {
+        $idx = [int]$poolSelection - 1
         if ($idx -ge 0 -and $idx -lt @($networkPools).Count) {
             $poolIndex = $idx
         } else {
@@ -1248,11 +1249,6 @@ $sanitisedPayload = $hostPayload | ForEach-Object {
 }
 $payloadJson = $sanitisedPayload | ConvertTo-Json -Depth 10
 
-if ($SavePayload) {
-    $payloadJson | Out-File -FilePath $PayloadPath -Encoding UTF8
-    Write-Host ("  Payload saved to: {0}" -f $PayloadPath) -ForegroundColor DarkGray
-}
-
 # Clear plaintext password from memory immediately after payload is built
 $esxiPlain = [string]::new('*', 16)
 Remove-Variable esxiPlain -ErrorAction SilentlyContinue
@@ -1285,9 +1281,7 @@ try {
     # Always save raw validation response and payload for inspection
     $valJsonPath = $PayloadPath -replace '_Payload\.json$', '_ValidationResponse.json'
     $valStatus | ConvertTo-Json -Depth 10 | Out-File -FilePath $valJsonPath -Encoding UTF8
-    if (-not $SavePayload) {
-        $payloadJson | Out-File -FilePath $PayloadPath -Encoding UTF8
-    }
+    $payloadJson | Out-File -FilePath $PayloadPath -Encoding UTF8
     Write-Host ("  Payload saved to     : {0}" -f $PayloadPath) -ForegroundColor DarkGray
     Write-Host ("  Validation response  : {0}" -f $valJsonPath) -ForegroundColor DarkGray
     Write-Host ""
@@ -1305,10 +1299,11 @@ try {
     # Also honour the top-level resultStatus from SDDC Manager
     $validationFailed = ($checksFailed.Count -gt 0) -or ($valStatus.resultStatus -eq "FAILED")
 
-    # Print full per-check breakdown
+    # Print full per-check breakdown using Get-AllLeafChecks for arbitrary nesting depth
     Write-Host "  Validation results:" -ForegroundColor Cyan
     if ($valStatus -and $valStatus.PSObject.Properties["validationChecks"]) {
-        foreach ($check in $valStatus.validationChecks) {
+        $allLeafChecks = Get-AllLeafChecks $valStatus.validationChecks
+        foreach ($check in $allLeafChecks) {
             $checkColor = switch ($check.resultStatus) {
                 "SUCCEEDED" { "Green"    }
                 "FAILED"    { "Red"      }
@@ -1323,7 +1318,7 @@ try {
             }
             Write-Host ("    {0} {1}" -f $icon, $check.description) -ForegroundColor $checkColor
 
-            # Print all available message properties on the check
+            # Flat message properties
             foreach ($msgProp in @("errorMessage","message","resultMessage")) {
                 if ($check.PSObject.Properties[$msgProp] -and $check.$msgProp) {
                     Write-Host ("           {0}: {1}" -f $msgProp, $check.$msgProp) -ForegroundColor DarkGray
@@ -1339,52 +1334,6 @@ try {
                         if ($check.errorResponse.context.PSObject.Properties[$fp] -and $check.errorResponse.context.$fp) {
                             Write-Host ("           errorResponse.context.{0}: {1}" -f $fp, $check.errorResponse.context.$fp) -ForegroundColor DarkGray
                             break
-                        }
-                    }
-                }
-            }
-
-            # Drill into nested checks -- SDDC Manager nests per-host detail here
-            foreach ($nestedProp in @("nestedValidationChecks","nestedChecks","validationChecks","checkItems")) {
-                if ($check.PSObject.Properties[$nestedProp] -and $check.$nestedProp) {
-                    foreach ($nested in $check.$nestedProp) {
-                        $nestedColor = switch ($nested.resultStatus) {
-                            "FAILED"    { "Red"    }
-                            "WARNING"   { "Yellow" }
-                            "SUCCEEDED" { "Green"  }
-                            default     { "DarkGray" }
-                        }
-                        $nestedIcon = switch ($nested.resultStatus) {
-                            "FAILED"    { "[FAIL]" }
-                            "WARNING"   { "[WARN]" }
-                            "SUCCEEDED" { "[PASS]" }
-                            default     { "[INFO]" }
-                        }
-                        Write-Host ("      {0} {1}" -f $nestedIcon, $nested.description) -ForegroundColor $nestedColor
-                        foreach ($msgProp in @("errorMessage","message","resultMessage")) {
-                            if ($nested.PSObject.Properties[$msgProp] -and $nested.$msgProp) {
-                                Write-Host ("             {0}: {1}" -f $msgProp, $nested.$msgProp) -ForegroundColor DarkGray
-                            }
-                        }
-                        if ($nested.PSObject.Properties["errorResponse"] -and $nested.errorResponse) {
-                            if ($nested.errorResponse.PSObject.Properties["message"] -and $nested.errorResponse.message) {
-                                Write-Host ("             errorResponse.message: {0}" -f $nested.errorResponse.message) -ForegroundColor Red
-                            }
-                        }
-                        # One more level deep -- some SDDC Manager versions nest 3 levels
-                        foreach ($deepProp in @("nestedValidationChecks","nestedChecks","checkItems")) {
-                            if ($nested.PSObject.Properties[$deepProp] -and $nested.$deepProp) {
-                                foreach ($deep in $nested.$deepProp) {
-                                    $deepColor = if ($deep.resultStatus -eq "FAILED") { "Red" } elseif ($deep.resultStatus -eq "WARNING") { "Yellow" } else { "DarkGray" }
-                                    $deepIcon  = if ($deep.resultStatus -eq "FAILED") { "[FAIL]" } elseif ($deep.resultStatus -eq "WARNING") { "[WARN]" } else { "[INFO]" }
-                                    Write-Host ("         {0} {1}" -f $deepIcon, $deep.description) -ForegroundColor $deepColor
-                                    foreach ($msgProp in @("errorMessage","message","resultMessage")) {
-                                        if ($deep.PSObject.Properties[$msgProp] -and $deep.$msgProp) {
-                                            Write-Host ("                {0}: {1}" -f $msgProp, $deep.$msgProp) -ForegroundColor DarkGray
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -1490,9 +1439,10 @@ try {
 Write-Host ""
 Write-Host "  Polling task status (timeout: $TimeoutMinutes minutes)..." -ForegroundColor Cyan
 
-$taskUri  = "https://$SddcManager/v1/tasks/$($task.id)"
-$deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-$taskDone = $false
+$taskUri    = "https://$SddcManager/v1/tasks/$($task.id)"
+$deadline   = (Get-Date).AddMinutes($TimeoutMinutes)
+$taskDone   = $false
+$taskStatus = $null
 
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 15
@@ -1545,6 +1495,11 @@ Write-Host ("=" * 62) -ForegroundColor DarkCyan
 # If task subtasks are available use them, otherwise show overall task status for all hosts
 $summaryRows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
+if ($null -eq $taskStatus) {
+    Write-Host "  WARNING: No task status was retrieved -- all poll attempts failed." -ForegroundColor Yellow
+    Write-Host "  Check SDDC Manager for task ID: $($task.id)" -ForegroundColor Yellow
+}
+
 $subTasks = if ($taskStatus -and $taskStatus.PSObject.Properties["subTasks"]) { $taskStatus.subTasks } else { $null }
 
 # Retrieve SDDC Manager host IDs for successfully commissioned hosts
@@ -1553,7 +1508,7 @@ $hostIdMap = Get-CommissionedHostIds -SddcManager $SddcManager -Token $token `
     -FQDNs @($hosts | Select-Object -ExpandProperty FQDN)
 
 foreach ($h in $hosts) {
-    $hostStatus = $taskStatus.status
+    $hostStatus = if ($taskStatus) { $taskStatus.status } else { "UNKNOWN" }
     $detail     = ""
 
     if ($subTasks) {
