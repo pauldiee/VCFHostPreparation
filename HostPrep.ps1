@@ -126,7 +126,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.0
+    Version : 3.7.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -216,6 +216,11 @@
                 Write-Host and Write-Warning calls converted to Write-Log;
                 log file defaults to script directory (same as report and
                 CSV); -NoNewline console-only calls produce no log entry
+        3.7.1 - Log Posh-SSH version on import for easier diagnostics; added
+                5-second delay after enabling SSH to allow sshd to start
+                before connecting; SSH key exchange failures now produce a
+                specific error message directing the user to Update-Module
+                Posh-SSH and noting ESXi FIPS mode as a potential cause
 #>
 
 [CmdletBinding()]
@@ -246,7 +251,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.0"
+    Version = "3.7.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -412,6 +417,8 @@ if (-not $WhatIfReport) {
     } else {
         Import-Module Posh-SSH -ErrorAction Stop
         $script:PoshSSHAvailable = $true
+        $poshSshVer = (Get-Module Posh-SSH).Version.ToString()
+        Write-Log "  Posh-SSH $poshSshVer loaded." -Color DarkGray
     }
 }
 
@@ -620,13 +627,25 @@ function Invoke-ESXiCertificateRegen {
     # Enable SSH temporarily
     Write-Log "  Enabling SSH temporarily for certificate regeneration..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
+    Start-Sleep -Seconds 5   # allow sshd to fully start before connecting
 
     $sshSession = $null
     try {
         # Connect via SSH
         Write-Log "  Connecting via SSH to run /sbin/generate-certificates..."
-        $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential `
-                        -AcceptKey -ErrorAction Stop
+        try {
+            $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential `
+                            -AcceptKey -ErrorAction Stop
+        } catch {
+            if ($_ -match 'Key exchange') {
+                throw "SSH key exchange negotiation failed connecting to $VMHost. " +
+                      "This is typically a Posh-SSH/SSH.NET version issue. " +
+                      "Run: Update-Module Posh-SSH  then retry. " +
+                      "If ESXi FIPS mode is enabled, SSH may be restricted to specific algorithms. " +
+                      "Original error: $_"
+            }
+            throw
+        }
 
         $sshResult = Invoke-SSHCommand -SessionId $sshSession.SessionId `
                         -Command "/sbin/generate-certificates" -ErrorAction Stop
