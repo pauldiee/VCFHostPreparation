@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 2.9.0
+    Version : 3.0.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -219,6 +219,13 @@
                 List[string] indexing behaviour; passing hosts now show PASS
                 badge only with no extra detail; FAIL rows still show the full
                 error message
+        3.0.0 - Added TLS certificate bypass for SDDC Manager self-signed/
+                internal CA certs: PS 5.1 uses TrustAllCertsPolicy + TLS 1.2;
+                PS 6+ uses -SkipCertificateCheck on Invoke-RestMethod; fixed
+                host commission payload always serialised as a JSON array by
+                wrapping foreach in @() and switching ConvertTo-Json to use
+                -InputObject (pipeline unroll caused single-host runs to send
+                an object instead of array, resulting in HTTP 400)
 #>
 
 [CmdletBinding()]
@@ -255,7 +262,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "2.9.0"
+    Version = "3.0.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -265,10 +272,10 @@ $ScriptMeta = @{
 
 #region --- Initialisation ---
 
-# Allow self-signed certificates if requested
-if ($SkipCertificateCheck) {
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
-        Add-Type @"
+# SDDC Manager uses a self-signed/internal CA cert — bypass TLS validation unconditionally.
+# PS 5.1: override the global certificate policy.
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
+    Add-Type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAllCerts : ICertificatePolicy {
@@ -276,10 +283,9 @@ public class TrustAllCerts : ICertificatePolicy {
         WebRequest req, int problem) { return true; }
 }
 "@
-    }
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
 }
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
+[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 
 # Required for HTML entity encoding in the commissioning report
 Add-Type -AssemblyName System.Web
@@ -324,17 +330,17 @@ function Invoke-SddcManagerApi {
     }
 
     $params = @{
-        Uri     = $Uri
-        Method  = $Method
-        Headers = $headers
+        Uri         = $Uri
+        Method      = $Method
+        Headers     = $headers
+        ErrorAction = 'Stop'
     }
 
-    if ($Body) {
-        $params["Body"] = ($Body | ConvertTo-Json -Depth 10 -Compress)
-    }
+    if ($Body) { $params["Body"] = (ConvertTo-Json -InputObject $Body -Depth 10 -Compress) }
+    if ($PSVersionTable.PSVersion.Major -ge 6) { $params['SkipCertificateCheck'] = $true }
 
     try {
-        return Invoke-RestMethod @params -ErrorAction Stop
+        return Invoke-RestMethod @params
     } catch {
         $statusCode = $_.Exception.Response.StatusCode.value__
         $detail     = $_.ErrorDetails.Message
@@ -364,12 +370,21 @@ function Get-SddcManagerToken {
     }
 
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method POST -Headers $headers `
-            -Body ($body | ConvertTo-Json -Compress) -ErrorAction Stop
+        $irmParams = @{
+            Uri         = $uri
+            Method      = 'POST'
+            Headers     = $headers
+            Body        = ($body | ConvertTo-Json -Compress)
+            ErrorAction = 'Stop'
+        }
+        if ($PSVersionTable.PSVersion.Major -ge 6) { $irmParams['SkipCertificateCheck'] = $true }
+
+        $response = Invoke-RestMethod @irmParams
         return $response.accessToken
     } catch {
         $statusCode = $_.Exception.Response.StatusCode.value__
-        throw "Authentication failed (HTTP $statusCode). Check credentials and SDDC Manager address."
+        $detail     = if ($statusCode) { "HTTP $statusCode" } else { $_.Exception.Message }
+        throw "Authentication failed ($detail). Check credentials and SDDC Manager address."
     }
 }
 
@@ -1229,7 +1244,7 @@ $esxiPlain    = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
 
 #region --- Build Host Payload ---
 
-$hostPayload = foreach ($h in $hosts) {
+$hostPayload = @(foreach ($h in $hosts) {
     @{
         fqdn            = $h.FQDN
         username        = "root"
@@ -1238,7 +1253,7 @@ $hostPayload = foreach ($h in $hosts) {
         networkPoolId   = $selectedPool.id
         networkPoolName = $selectedPool.name
     }
-}
+})
 
 # Save sanitised payload to disk before clearing the password.
 # The password field is masked -- the file is safe to share for debugging.
@@ -1247,7 +1262,7 @@ $sanitisedPayload = $hostPayload | ForEach-Object {
     $copy["password"] = "********"
     $copy
 }
-$payloadJson = $sanitisedPayload | ConvertTo-Json -Depth 10
+$payloadJson = ConvertTo-Json -InputObject $sanitisedPayload -Depth 10
 
 # Clear plaintext password from memory immediately after payload is built
 $esxiPlain = [string]::new('*', 16)
