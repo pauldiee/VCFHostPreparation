@@ -126,7 +126,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.3
+    Version : 3.7.4
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -211,6 +211,9 @@
                 VSAN_ESA or VVOL if needed before running
                 Commission-VCFHosts.ps1; detected type written per-host
                 to the commissioning CSV
+        3.7.4 - CN mismatch (both pre-regen hostname check and post-regen
+                verify) now sets $hostResult.Error so the host shows as
+                failed (red) in the console and HTML report
         3.7.3 - Before cert regen, compare ESXi configured hostname (via
                 Get-VMHostNetwork) to the FQDN from the hosts file; if they
                 differ, skip regen and flag as CN mismatch immediately --
@@ -258,7 +261,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.3"
+    Version = "3.7.4"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -1544,6 +1547,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
                         Write-Log "  the regenerated certificate will still have the wrong CN." -Level WARN
                         $hostResult.CertRegen = "CN mismatch"
                         $hostResult.Rebooted  = "Skipped"
+                        $hostResult.Error     = "ESXi hostname '$esxiFqdn' does not match '$esxiHost' -- correct the hostname before commissioning."
                     } else {
 
                     $certRegenSuccess = Invoke-ESXiCertificateRegen `
@@ -1582,6 +1586,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
                         $hostResult.Expiry     = $newCertCheck.Expiry
                         if ($newCertCheck.NeedsRegen) {
                             $hostResult.CertRegen = "CN mismatch"
+                            $hostResult.Error     = "Certificate CN '$($newCertCheck.CN)' still does not match '$esxiHost' after regeneration -- correct the ESXi hostname before commissioning."
                             Write-Log "  WARNING: Certificate CN still does not match hostname after regeneration." -Level WARN
                             Write-Log "  CN: $($newCertCheck.CN)  --  Expected: $esxiHost" -Level WARN
                         }
