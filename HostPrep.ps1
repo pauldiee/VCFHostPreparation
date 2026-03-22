@@ -126,7 +126,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 3.7.1
+    Version : 3.7.2
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-20
@@ -211,6 +211,10 @@
                 VSAN_ESA or VVOL if needed before running
                 Commission-VCFHosts.ps1; detected type written per-host
                 to the commissioning CSV
+        3.7.2 - CN mismatch after cert regen now marks the host as not ready:
+                red in the console summary table, red in the HTML report,
+                and overall row status set to warn so the host is not shown
+                as successful (VCF will not accept a mismatched CN)
         3.7.1 - After cert regen and reboot, re-check CN vs FQDN; if still
                 mismatched set CertRegen to "CN mismatch" with a WARN log
                 entry and highlight it in red in the HTML report
@@ -249,7 +253,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "3.7.1"
+    Version = "3.7.2"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -828,6 +832,7 @@ function Get-CellColor ($value) {
     if ($value -eq "Timeout")                          { return "Red"      }
     if ($value -like "Unexpected*")                    { return "Yellow"   }
     if ($value -like "WARN:*")                         { return "Yellow"   }
+    if ($value -eq "CN mismatch")                      { return "Red"      }
     return "White"
 }
 function Test-DNSResolution {
@@ -1021,7 +1026,8 @@ function Write-HtmlReport {
             (-not $row.Error) -and
             ($row.Connected -eq $true) -and
             ($row.NTP -eq "OK") -and
-            ($row.AdvancedSettings -eq "OK")
+            ($row.AdvancedSettings -eq "OK") -and
+            ($row.CertRegen -ne "CN mismatch")
         }
 
         $rowClass = if ($row.Error) { "fail" } elseif ($overallOk) { "ok" } else { "warn" }
