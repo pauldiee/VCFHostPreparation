@@ -115,10 +115,10 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 3.0.1
+    Version : 3.1.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-03-20
+    Date    : 2026-04-02
 
     Changelog:
         1.0.0 - Initial release. Reads HostPrep CSV, authenticates to SDDC Manager,
@@ -219,6 +219,10 @@
                 List[string] indexing behaviour; passing hosts now show PASS
                 badge only with no extra detail; FAIL rows still show the full
                 error message
+        3.1.0 - Validation timeout increased from 5 to 10 minutes; UNKNOWN
+                resultStatus no longer treated as PASSED -- only SUCCEEDED
+                maps to PASSED; any other status including UNKNOWN now
+                shows as UNKNOWN (grey) and blocks commissioning
         3.0.1 - Gated ICertificatePolicy Add-Type block behind PS version check
                 (Major -lt 6); ICertificatePolicy was removed in .NET 6 and
                 caused a CS0246 compile error on PowerShell 7+; PS 6+ already
@@ -266,7 +270,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "3.0.1"
+    Version = "3.1.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
