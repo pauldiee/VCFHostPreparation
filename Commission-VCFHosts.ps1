@@ -1289,7 +1289,7 @@ try {
     Write-Host "  Validation submitted. Validation ID: $($validation.id)" -ForegroundColor DarkGray
 
     # Poll validation until complete
-    $valDeadline = (Get-Date).AddMinutes(5)
+    $valDeadline = (Get-Date).AddMinutes(10)
     $valStatus   = $null
     while ((Get-Date) -lt $valDeadline) {
         Start-Sleep -Seconds 5
