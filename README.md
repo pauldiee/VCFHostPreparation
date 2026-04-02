@@ -5,7 +5,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 | Script | Version | Purpose |
 |---|---|---|
 | `HostPrep.ps1` | 4.0.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
-| `Commission-VCFHosts.ps1` | 2.9.0 | Commissions prepared hosts into SDDC Manager via the REST API |
+| `Commission-VCFHosts.ps1` | 3.0.1 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
 
@@ -118,7 +118,7 @@ Without Posh-SSH the script prints per-host manual instructions for the certific
 | `-NtpServers` | `string[]` | `pool.ntp.org` | One or more NTP server addresses |
 | `-DryRun` | `switch` | — | Simulate all steps, no changes made |
 | `-WhatIfReport` | `switch` | — | Read thumbprints and generate report/CSV without changes |
-| `-LogPath` | `string` | Desktop | Path for the transcript log |
+| `-LogPath` | `string` | Next to script | Path for the transcript log |
 | `-ReportPath` | `string` | Next to script | Path for the HTML commissioning report |
 | `-WipeDisk` | `switch` | — | Wipe non-boot partitioned disks on VSAN hosts via SSH before cert regen |
 | `-CsvPath` | `string` | Next to script | Path for the commissioning CSV |
@@ -270,6 +270,12 @@ No additional modules required beyond PowerShell 5.1. All API calls use `Invoke-
 
 Full write-up with background and screenshots:  
 [Automating ESXi Host Preparation for VCF 9 with PowerShell – HolleBollevSAN](https://www.hollebollevsan.nl/automating-esxi-host-preparation-for-vcf-9-with-powershell/)
+
+---
+
+## Next step
+
+Once your hosts are commissioned into SDDC Manager, use the scripts in [VCFJsonSpecCreators](https://github.com/pauldiee/VCFJsonSpecCreators) to build the JSON payloads for creating network pools, workload domains, and clusters.
 
 ---
 

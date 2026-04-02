@@ -97,7 +97,7 @@
     One or more NTP server addresses. Defaults to 'pool.ntp.org'.
 
 .PARAMETER LogPath
-    Path to write the transcript log. Defaults to the script directory.
+    Path to write the log file. Defaults to the script directory.
 
 .PARAMETER DryRun
     Simulates all steps without making any changes. All actions are logged
@@ -229,6 +229,26 @@
                 VSAN_ESA or VVOL if needed before running
                 Commission-VCFHosts.ps1; detected type written per-host
                 to the commissioning CSV
+        3.7.4 - CN mismatch (both pre-regen hostname check and post-regen
+                verify) now sets $hostResult.Error so the host shows as
+                failed (red) in the console and HTML report
+        3.7.3 - Before cert regen, compare ESXi configured hostname (via
+                Get-VMHostNetwork) to the FQDN from the hosts file; if they
+                differ, skip regen and flag as CN mismatch immediately --
+                generate-certificates uses the host's own hostname so regen
+                would produce the same wrong CN and the reboot is wasted
+        3.7.2 - CN mismatch after cert regen now marks the host as not ready:
+                red in the console summary table, red in the HTML report,
+                and overall row status set to warn so the host is not shown
+                as successful (VCF will not accept a mismatched CN)
+        3.7.1 - After cert regen and reboot, re-check CN vs FQDN; if still
+                mismatched set CertRegen to "CN mismatch" with a WARN log
+                entry and highlight it in red in the HTML report
+        3.7.0 - Replaced Start/Stop-Transcript with Write-Log: timestamped
+                INFO/WARN/ERROR entries written to the log file; all
+                Write-Host and Write-Warning calls converted to Write-Log;
+                log file defaults to script directory (same as report and
+                CSV); -NoNewline console-only calls produce no log entry
         4.0.0 - Added -WipeDisk switch and Invoke-VSANDiskWipe helper:
                 enumerates non-boot disks with existing partitions via
                 esxcli, prompts Y/N per host, wipes partition tables via
@@ -333,6 +353,52 @@ $OptionalAdvancedSettings = @(
 
 #endregion
 
+#region --- Logging ---
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Writes a timestamped, levelled log entry to both the log file and the console.
+    .PARAMETER Message
+        The message to log. Empty strings produce a blank console line only (no file entry).
+    .PARAMETER Level
+        INFO (default), WARN, or ERROR.
+    .PARAMETER Color
+        Explicit console colour override. If omitted, defaults to Cyan (INFO), Yellow (WARN), Red (ERROR).
+    .PARAMETER NoNewline
+        Passes -NoNewline to Write-Host. No log file entry is written for partial lines.
+    #>
+    param(
+        [string]$Message = "",
+        [ValidateSet('INFO','WARN','ERROR')]
+        [string]$Level = 'INFO',
+        [System.ConsoleColor]$Color,
+        [switch]$NoNewline
+    )
+
+    # Only write complete, non-empty lines to the log file
+    if (-not $NoNewline -and $Message -ne "") {
+        $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        "[{0}] {1,-5}  {2}" -f $ts, $Level, $Message.TrimStart() |
+            Add-Content -Path $script:LogPath -Encoding UTF8
+    }
+
+    # Console colour: explicit -Color > level default
+    $consoleColor = if ($PSBoundParameters.ContainsKey('Color')) {
+        $Color
+    } else {
+        switch ($Level) {
+            'ERROR' { [System.ConsoleColor]::Red    }
+            'WARN'  { [System.ConsoleColor]::Yellow }
+            default { [System.ConsoleColor]::Cyan   }
+        }
+    }
+
+    Write-Host $Message -ForegroundColor $consoleColor -NoNewline:$NoNewline
+}
+
+#endregion
+
 #region --- Initialisation ---
 
 # Suppress PowerCLI CEIP nag. The warning fires on first module load in any
@@ -345,19 +411,24 @@ if ($null -eq $ceipConfig.ParticipateInCEIP) {
 Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -InvalidCertificateAction Ignore -Confirm:$false -WarningAction SilentlyContinue | Out-Null
 
 $bannerWidth = 62
-Write-Host ""
-Write-Host ("=" * $bannerWidth) -ForegroundColor DarkCyan
-Write-Host ("  {0,-30} {1}" -f $ScriptMeta.Name, ("v" + $ScriptMeta.Version)) -ForegroundColor Cyan
-Write-Host ("  Author : {0}" -f $ScriptMeta.Author) -ForegroundColor Cyan
-Write-Host ("  Blog   : {0}" -f $ScriptMeta.Blog) -ForegroundColor Cyan
-Write-Host ("  Date   : {0}" -f $ScriptMeta.Date) -ForegroundColor DarkGray
-Write-Host ("=" * $bannerWidth) -ForegroundColor DarkCyan
-Write-Host ""
+
+# Initialise log file with a session header
+"[{0}] {1,-5}  {2} v{3} -- Session started" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), "INFO", $ScriptMeta.Name, $ScriptMeta.Version |
+    Out-File -FilePath $LogPath -Encoding UTF8
+
+Write-Log ""
+Write-Log ("=" * $bannerWidth) -Color DarkCyan
+Write-Log ("  {0,-30} {1}" -f $ScriptMeta.Name, ("v" + $ScriptMeta.Version))
+Write-Log ("  Author : {0}" -f $ScriptMeta.Author)
+Write-Log ("  Blog   : {0}" -f $ScriptMeta.Blog)
+Write-Log ("  Date   : {0}" -f $ScriptMeta.Date) -Color DarkGray
+Write-Log ("=" * $bannerWidth) -Color DarkCyan
+Write-Log ""
 
 if ($DryRun) {
-    Write-Host "  *** DRY RUN MODE - No changes will be made ***" -ForegroundColor Yellow
-    Write-Host ("  " + $ScriptMeta.Blog) -ForegroundColor DarkGray
-    Write-Host ""
+    Write-Log "  *** DRY RUN MODE - No changes will be made ***" -Level WARN
+    Write-Log ("  " + $ScriptMeta.Blog) -Color DarkGray
+    Write-Log ""
 }
 
 if ($WipeDisk) {
@@ -371,26 +442,30 @@ if ($WipeDisk) {
 }
 
 if ($WhatIfReport) {
-    Write-Host "  *** WHATIF REPORT MODE - Thumbprint collection only ***" -ForegroundColor Cyan
-    Write-Host "  Connects to each host, reads certificate thumbprint and expiry," -ForegroundColor DarkGray
-    Write-Host "  then generates the HTML report. No changes will be made." -ForegroundColor DarkGray
-    Write-Host ("  " + $ScriptMeta.Blog) -ForegroundColor DarkGray
-    Write-Host ""
+    Write-Log "  *** WHATIF REPORT MODE - Thumbprint collection only ***"
+    Write-Log "  Connects to each host, reads certificate thumbprint and expiry," -Color DarkGray
+    Write-Log "  then generates the HTML report. No changes will be made." -Color DarkGray
+    Write-Log ("  " + $ScriptMeta.Blog) -Color DarkGray
+    Write-Log ""
 }
 
-# Start transcript for audit logging
-Start-Transcript -Path $LogPath -Append
-Write-Host "HostPrep started at $(Get-Date)" -ForegroundColor Cyan
+# Mutual exclusion guard -- only one mode at a time
+if ($DryRun -and $WhatIfReport) {
+    Write-Log "  ERROR: -DryRun and -WhatIfReport are mutually exclusive. Specify one at a time." -Level ERROR
+    exit 1
+}
+
+Write-Log "HostPrep started at $(Get-Date)"
 
 # Verify optional modules (Posh-SSH needed for cert regen  --  not relevant in WhatIfReport mode)
 $script:PoshSSHAvailable = $false
 if (-not $WhatIfReport) {
     if (-not (Get-Module -ListAvailable -Name "Posh-SSH")) {
-        Write-Host ""
-        Write-Host "  WARNING: The 'Posh-SSH' module is not installed." -ForegroundColor Yellow
-        Write-Host "  Certificate regeneration will be skipped for all hosts." -ForegroundColor Yellow
-        Write-Host "  To enable it, run: Install-Module -Name Posh-SSH -Scope CurrentUser" -ForegroundColor Yellow
-        Write-Host ""
+        Write-Log ""
+        Write-Log "  WARNING: The 'Posh-SSH' module is not installed." -Level WARN
+        Write-Log "  Certificate regeneration will be skipped for all hosts." -Level WARN
+        Write-Log "  To enable it, run: Install-Module -Name Posh-SSH -Scope CurrentUser" -Level WARN
+        Write-Log ""
     } else {
         Import-Module Posh-SSH -ErrorAction Stop
         $script:PoshSSHAvailable = $true
@@ -541,16 +616,16 @@ function Test-ESXiCertificateNeedsRegen {
 
         $expiry = $cert.NotAfter.ToString("yyyy-MM-dd HH:mm:ss")
 
-        Write-Host "  Certificate CN  : $cn" -ForegroundColor DarkGray
-        Write-Host "  Host FQDN       : $VMHost" -ForegroundColor DarkGray
-        Write-Host "  Expires         : $expiry" -ForegroundColor DarkGray
-        Write-Host "  SHA256:base64   : $thumbprint" -ForegroundColor DarkGray
+        Write-Log "  Certificate CN  : $cn" -Color DarkGray
+        Write-Log "  Host FQDN       : $VMHost" -Color DarkGray
+        Write-Log "  Expires         : $expiry" -Color DarkGray
+        Write-Log "  SHA256:base64   : $thumbprint" -Color DarkGray
 
         $needsRegen = $cn -ne $VMHost
         if ($needsRegen) {
-            Write-Host "  CN does not match hostname. Regeneration needed." -ForegroundColor Yellow
+            Write-Log "  CN does not match hostname. Regeneration needed." -Level WARN
         } else {
-            Write-Host "  CN matches hostname. Regeneration not needed." -ForegroundColor Green
+            Write-Log "  CN matches hostname. Regeneration not needed." -Color Green
         }
 
         return [PSCustomObject]@{
@@ -561,8 +636,8 @@ function Test-ESXiCertificateNeedsRegen {
         }
 
     } catch {
-        Write-Warning "  Could not read certificate from $VMHost port 443: $_"
-        Write-Warning "  Proceeding with regeneration to be safe."
+        Write-Log "  Could not read certificate from $VMHost port 443: $_" -Level WARN
+        Write-Log "  Proceeding with regeneration to be safe." -Level WARN
         return [PSCustomObject]@{
             NeedsRegen  = $true
             Thumbprint  = "N/A"
@@ -600,13 +675,13 @@ function Invoke-ESXiCertificateRegen {
     )
 
     # Enable SSH temporarily
-    Write-Host "  Enabling SSH temporarily for certificate regeneration..." -ForegroundColor Yellow
+    Write-Log "  Enabling SSH temporarily for certificate regeneration..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
 
     $sshSession = $null
     try {
         # Connect via SSH
-        Write-Host "  Connecting via SSH to run /sbin/generate-certificates..." -ForegroundColor Cyan
+        Write-Log "  Connecting via SSH to run /sbin/generate-certificates..."
         $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential `
                         -AcceptKey -ErrorAction Stop
 
@@ -617,7 +692,7 @@ function Invoke-ESXiCertificateRegen {
             throw "/sbin/generate-certificates exited with code $($sshResult.ExitStatus). Output: $($sshResult.Output -join ' ')"
         }
 
-        Write-Host "  Certificate regenerated successfully on $VMHost." -ForegroundColor Green
+        Write-Log "  Certificate regenerated successfully on $VMHost." -Color Green
         return $true
 
     } finally {
@@ -625,7 +700,7 @@ function Invoke-ESXiCertificateRegen {
         if ($sshSession) {
             Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null
         }
-        Write-Host "  Disabling SSH..." -ForegroundColor Yellow
+        Write-Log "  Disabling SSH..." -Level WARN
         $svc = Get-VMHostService -VMHost $VMHostObj | Where-Object { $_.Key -eq "TSM-SSH" }
         if ($svc) {
             $svc | Set-VMHostService -Policy "off" -Confirm:$false | Out-Null
@@ -633,7 +708,7 @@ function Invoke-ESXiCertificateRegen {
                 $svc | Stop-VMHostService -Confirm:$false | Out-Null
             }
         }
-        Write-Host "  SSH disabled." -ForegroundColor Green
+        Write-Log "  SSH disabled." -Color Green
     }
 }
 
@@ -659,7 +734,7 @@ function Wait-ESXiHostOnline {
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    Write-Host "  Waiting for $VMHost to come back online (timeout: ${TimeoutSeconds}s)..." -ForegroundColor Cyan
+    Write-Log "  Waiting for $VMHost to come back online (timeout: ${TimeoutSeconds}s)..."
 
     # Brief initial pause to allow the host to begin its shutdown sequence
     Start-Sleep -Seconds 30
@@ -671,7 +746,7 @@ function Wait-ESXiHostOnline {
             $wait    = $connect.AsyncWaitHandle.WaitOne(3000, $false)
             if ($wait -and $tcp.Connected) {
                 $tcp.Close()
-                Write-Host "  $VMHost is back online." -ForegroundColor Green
+                Write-Log "  $VMHost is back online." -Color Green
                 # Brief extra pause to let services fully initialise
                 Start-Sleep -Seconds 15
                 return $true
@@ -680,8 +755,7 @@ function Wait-ESXiHostOnline {
         } catch {
             # Connection refused or timed out  --  host still rebooting
         }
-        Write-Host "  Still waiting... ($(
-            [int]($deadline - (Get-Date)).TotalSeconds)s remaining)" -ForegroundColor DarkGray
+        Write-Log "  Still waiting... ($([int]($deadline - (Get-Date)).TotalSeconds)s remaining)" -Color DarkGray
         Start-Sleep -Seconds $PollIntervalSeconds
     }
 
@@ -702,20 +776,20 @@ function Set-VMHostServiceConfig {
     $svc = Get-VMHostService -VMHost $VMHost | Where-Object { $_.Key -eq $ServiceKey }
 
     if (-not $svc) {
-        Write-Warning "  Service '$ServiceKey' not found on host."
+        Write-Log "  Service '$ServiceKey' not found on host." -Level WARN
         return
     }
 
     if ($svc.Policy -ne $Policy) {
-        Write-Host "  Setting '$ServiceKey' startup policy to '$Policy'..." -ForegroundColor Yellow
+        Write-Log "  Setting '$ServiceKey' startup policy to '$Policy'..." -Level WARN
         $svc | Set-VMHostService -Policy $Policy -Confirm:$false | Out-Null
     }
 
     if (-not $svc.Running) {
-        Write-Host "  Starting service '$ServiceKey'..." -ForegroundColor Yellow
+        Write-Log "  Starting service '$ServiceKey'..." -Level WARN
         $svc | Start-VMHostService -Confirm:$false | Out-Null
     } else {
-        Write-Host "  Service '$ServiceKey' is already running with policy '$Policy'." -ForegroundColor Green
+        Write-Log "  Service '$ServiceKey' is already running with policy '$Policy'." -Color Green
     }
 }
 
@@ -782,20 +856,20 @@ function Reset-ESXiAccountPassword {
         throw "ESXCLI returned unexpected result '$result' - password may not have changed."
     }
 
-    Write-Host "  Password reset successfully for 'root' on $($VMHost.Name)." -ForegroundColor Green
+    Write-Log "  Password reset successfully for 'root' on $($VMHost.Name)." -Color Green
 
     # Warn if root is the same account used for the active session -
     # the current connection credential is now stale for any subsequent reconnects
     if ($ConnectedUsername -eq "root") {
-        Write-Warning ("  The reset account 'root' is the same as the active session credential. " +
-                       "Any reconnection attempt on this host will fail until credentials are updated.")
+        Write-Log ("  The reset account 'root' is the same as the active session credential. " +
+                   "Any reconnection attempt on this host will fail until credentials are updated.") -Level WARN
     }
 
     # Record this host so the operator can audit which hosts were processed
     if ($script:PasswordResetCompleted) {
         $script:PasswordResetCompleted.Add($VMHost)
-        Write-Host ("  Hosts with password reset completed this run: " +
-                    ($script:PasswordResetCompleted -join ', ')) -ForegroundColor DarkGray
+        Write-Log ("  Hosts with password reset completed this run: " +
+                   ($script:PasswordResetCompleted -join ', ')) -Color DarkGray
     }
 }
 
@@ -808,6 +882,7 @@ function Get-CellColor ($value) {
     if ($value -eq "Timeout")                          { return "Red"      }
     if ($value -like "Unexpected*")                    { return "Yellow"   }
     if ($value -like "WARN:*")                         { return "Yellow"   }
+    if ($value -eq "CN mismatch")                      { return "Red"      }
     return "White"
 }
 function Test-DNSResolution {
@@ -898,7 +973,7 @@ function Get-ESXiStorageType {
         # FC HBA check -- presence of FibreChannel HBAs indicates VMFS_FC intent
         $fcHbas = Get-VMHostHba -VMHost $VMHostObj -Type FibreChannel -ErrorAction SilentlyContinue
         if ($fcHbas -and @($fcHbas).Count -gt 0) {
-            Write-Host "  Storage type detected : VMFS_FC (Fibre Channel HBA present)" -ForegroundColor DarkGray
+            Write-Log "  Storage type detected : VMFS_FC (Fibre Channel HBA present)" -Color DarkGray
             return "VMFS_FC"
         }
 
@@ -906,17 +981,17 @@ function Get-ESXiStorageType {
         $nfsDs = Get-Datastore -VMHost $VMHostObj -ErrorAction SilentlyContinue |
                     Where-Object { $_.Type -eq "NFS" -or $_.Type -eq "NFS41" }
         if ($nfsDs -and @($nfsDs).Count -gt 0) {
-            Write-Host "  Storage type detected : NFS (NFS datastore mounted)" -ForegroundColor DarkGray
+            Write-Log "  Storage type detected : NFS (NFS datastore mounted)" -Color DarkGray
             return "NFS"
         }
 
         # Default -- vSAN hosts have unclaimed disks at commissioning time;
         # OSA vs ESA is a design choice and must be set manually if ESA is intended.
-        Write-Host "  Storage type detected : VSAN (default -- edit StorageType in the CSV to VSAN_ESA or VVOL if needed)" -ForegroundColor DarkGray
+        Write-Log "  Storage type detected : VSAN (default -- edit StorageType in the CSV to VSAN_ESA or VVOL if needed)" -Color DarkGray
         return "VSAN"
 
     } catch {
-        Write-Host "  Storage type detection failed: $_ -- defaulting to VSAN" -ForegroundColor Yellow
+        Write-Log "  Storage type detection failed: $_ -- defaulting to VSAN" -Level WARN
         return "VSAN"
     }
 }
@@ -1183,26 +1258,25 @@ function Write-ColorSummaryTable {
 
     $divider = "+" + (($columns.Values | ForEach-Object { "-" * ($_ + 2) }) -join "+") + "+"
 
-    Write-Host ""
-    Write-Host $divider -ForegroundColor DarkCyan
+    Write-Log ""
+    Write-Log $divider -Color DarkCyan
 
     # Header row
     $headerLine = "|"
     foreach ($col in $columns.GetEnumerator()) {
         $headerLine += " {0,-$($col.Value)} |" -f $col.Key
     }
-    Write-Host $headerLine -ForegroundColor Cyan
-    Write-Host $divider -ForegroundColor DarkCyan
+    Write-Log $headerLine
+    Write-Log $divider -Color DarkCyan
 
     # Data rows
     foreach ($row in $Data) {
         # Determine row base colour from Connected + Error
         $rowColor = if ($row.Error) { "Red" } elseif ($row.Connected) { "White" } else { "DarkYellow" }
 
-        # Write the row, then rewrite individual cells with colour
-        # PowerShell can't inline per-cell colour in a single Write-Host,
-        # so we print cell by cell
-        Write-Host "|" -ForegroundColor DarkCyan -NoNewline
+        # Write the row cell by cell so each cell can have its own colour.
+        # -NoNewline calls go to console only (no log file entry).
+        Write-Log "|" -Color DarkCyan -NoNewline
         foreach ($col in $columns.GetEnumerator()) {
             $val     = $row.($col.Key)
             $display = if ($null -eq $val) { "" } else { "$val" }
@@ -1210,19 +1284,20 @@ function Write-ColorSummaryTable {
             $padded  = " {0,-$($col.Value)} " -f $display
             $color   = Get-CellColor $val
             if ($color -eq "White") { $color = $rowColor }
-            Write-Host $padded -ForegroundColor $color -NoNewline
-            Write-Host "|" -ForegroundColor DarkCyan -NoNewline
+            Write-Log $padded -Color $color -NoNewline
+            Write-Log "|" -Color DarkCyan -NoNewline
         }
-        Write-Host ""  # newline
+        Write-Log ""  # newline
     }
 
-    Write-Host $divider -ForegroundColor DarkCyan
+    Write-Log $divider -Color DarkCyan
 }
 
 function Write-HtmlReport {
     param (
         [System.Collections.Generic.List[PSCustomObject]]$Data,
-        [string]$ReportPath
+        [string]$ReportPath,
+        [switch]$WhatIfReport
     )
 
     $totalCount   = [int]$Data.Count
@@ -1241,7 +1316,8 @@ function Write-HtmlReport {
             (-not $row.Error) -and
             ($row.Connected -eq $true) -and
             ($row.NTP -eq "OK") -and
-            ($row.AdvancedSettings -eq "OK")
+            ($row.AdvancedSettings -eq "OK") -and
+            ($row.CertRegen -ne "CN mismatch")
         }
 
         $rowClass = if ($row.Error) { "fail" } elseif ($overallOk) { "ok" } else { "warn" }
@@ -1287,6 +1363,7 @@ function Write-HtmlReport {
                 elseif ($row.CertRegen -eq 'Skipped')               { 'Not needed' }
                 elseif ($row.CertRegen -eq 'Manual')                { 'Manual required' }
                 elseif ($row.CertRegen -eq 'Regen needed')          { '<span class=expiry-warn>Regen needed</span>' }
+                elseif ($row.CertRegen -eq 'CN mismatch')           { '<span class=expiry-critical>CN mismatch after regen</span>' }
                 else                                                 { [System.Web.HttpUtility]::HtmlEncode($row.CertRegen) }
             )</td>
             <td>$(
@@ -1433,45 +1510,79 @@ function copyThumb(btn) {
 "@
 
     $html | Out-File -FilePath $ReportPath -Encoding UTF8
-    Write-Host ("  HTML report written to: {0}" -f $ReportPath) -ForegroundColor Cyan
+    Write-Log ("  HTML report written to: {0}" -f $ReportPath)
 }
+
+#endregion
+#region --- Host List Selection ---
+
+$hostFilePath = $null
+while (-not $hostFilePath) {
+    $raw = (Read-Host "  Enter full path to the host list .txt file").Trim()
+
+    # Strip surrounding quotes that Windows sometimes adds when copy-pasting paths
+    $raw = $raw.Trim('"').Trim("'")
+
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        Write-Log "  Path cannot be empty. Please try again." -Level WARN
+        continue
+    }
+
+    if (-not (Test-Path -LiteralPath $raw -PathType Leaf)) {
+        Write-Log "  File not found: '$raw'" -Level WARN
+        Write-Log "  Please check the path and try again." -Level WARN
+        continue
+    }
+
+    $hostFilePath = $raw
+}
+
+$targetEsxiHosts = Get-Content -LiteralPath $hostFilePath |
+    Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' }
+
+if (-not $targetEsxiHosts) {
+    Write-Log "Host list is empty. Exiting." -Level ERROR
+    exit 1
+}
+
+Write-Log "  Loaded $($targetEsxiHosts.Count) host(s) from: $hostFilePath"
 
 #endregion
 #region --- Credential Gathering ---
 
-Write-Host "`nGathering credentials..." -ForegroundColor Cyan
+Write-Log "`nGathering credentials..."
 
 $esxiPassword    = Read-Host "Enter the 'root' password used to connect to the ESXi hosts" -AsSecureString
 $esxiCredentials = New-Object System.Management.Automation.PSCredential("root", $esxiPassword)
 
 # Ask interactively whether to reset the root account password
 # (not applicable in WhatIfReport mode  --  no changes are made)
-Write-Host ""
+Write-Log ""
 if ($WhatIfReport) {
     $ResetPassword = $false
-    Write-Host "  Password reset: SKIPPED (WhatIfReport mode)" -ForegroundColor DarkGray
+    Write-Log "  Password reset: SKIPPED (WhatIfReport mode)" -Color DarkGray
 } else {
 $resetAnswer = $null
 while ($resetAnswer -notin @('Y','N')) {
     $resetAnswer = (Read-Host "  Do you want to reset the root account password on all hosts? [Y/N]").Trim().ToUpper()
     if ($resetAnswer -notin @('Y','N')) {
-        Write-Host "  Please enter Y or N." -ForegroundColor Yellow
+        Write-Log "  Please enter Y or N." -Level WARN
     }
 }
 $ResetPassword = ($resetAnswer -eq 'Y')
 
 if ($ResetPassword) {
-    Write-Host "  Password reset: ENABLED" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  New password must meet VCF 9 requirements:" -ForegroundColor Cyan
-    Write-Host "    - 15 to 40 characters" -ForegroundColor DarkGray
-    Write-Host "    - At least 1 lowercase letter" -ForegroundColor DarkGray
-    Write-Host "    - At least 1 uppercase letter (not as the first character)" -ForegroundColor DarkGray
-    Write-Host "    - At least 1 digit (not as the last character)" -ForegroundColor DarkGray
-    Write-Host "    - At least 1 special character from: @ ! # `$ % ? ^" -ForegroundColor DarkGray
-    Write-Host "    - Only letters, digits, and @ ! # `$ % ? ^ are permitted" -ForegroundColor DarkGray
-    Write-Host "    - At least 3 of the 4 character classes must be present" -ForegroundColor DarkGray
-    Write-Host ""
+    Write-Log "  Password reset: ENABLED" -Level WARN
+    Write-Log ""
+    Write-Log "  New password must meet VCF 9 requirements:"
+    Write-Log "    - 15 to 40 characters" -Color DarkGray
+    Write-Log "    - At least 1 lowercase letter" -Color DarkGray
+    Write-Log "    - At least 1 uppercase letter (not as the first character)" -Color DarkGray
+    Write-Log "    - At least 1 digit (not as the last character)" -Color DarkGray
+    Write-Log "    - At least 1 special character from: @ ! # `$ % ? ^" -Color DarkGray
+    Write-Log "    - Only letters, digits, and @ ! # `$ % ? ^ are permitted" -Color DarkGray
+    Write-Log "    - At least 3 of the 4 character classes must be present" -Color DarkGray
+    Write-Log ""
 
     $NewPassword       = $null
     $passwordCompliant = $false
@@ -1480,7 +1591,7 @@ if ($ResetPassword) {
         $NewPassword = Read-Host "  Enter NEW root password" -AsSecureString
 
         if ($NewPassword.Length -eq 0) {
-            Write-Host "  Password cannot be empty. Please try again." -ForegroundColor Yellow
+            Write-Log "  Password cannot be empty. Please try again." -Level WARN
             continue
         }
 
@@ -1505,20 +1616,20 @@ if ($ResetPassword) {
 
             if ($match) {
                 $passwordCompliant = $true
-                Write-Host "  Password meets all VCF 9 requirements." -ForegroundColor Green
-                Write-Host ""
+                Write-Log "  Password meets all VCF 9 requirements." -Color Green
+                Write-Log ""
             } else {
-                Write-Host "  Passwords do not match. Please try again." -ForegroundColor Yellow
-                Write-Host ""
+                Write-Log "  Passwords do not match. Please try again." -Level WARN
+                Write-Log ""
             }
         } else {
-            Write-Host ""
-            Write-Host "  Password does not meet VCF 9 requirements:" -ForegroundColor Red
+            Write-Log ""
+            Write-Log "  Password does not meet VCF 9 requirements:" -Level ERROR
             foreach ($failure in $validation.Failures) {
-                Write-Host "    x $failure" -ForegroundColor Yellow
+                Write-Log "    x $failure" -Level WARN
             }
-            Write-Host "  Please enter a new password." -ForegroundColor Cyan
-            Write-Host ""
+            Write-Log "  Please enter a new password."
+            Write-Log ""
         }
     }
 
@@ -1527,45 +1638,10 @@ if ($ResetPassword) {
     # see in the log which hosts were already changed.
     $script:PasswordResetCompleted = [System.Collections.Generic.List[string]]::new()
 } else {
-    Write-Host "  Password reset: SKIPPED" -ForegroundColor DarkGray
+    Write-Log "  Password reset: SKIPPED" -Color DarkGray
 }
 } # end else (not WhatIfReport) for password prompt
-Write-Host ""
-
-#endregion
-#region --- Host List Selection ---
-
-$hostFilePath = $null
-while (-not $hostFilePath) {
-    $raw = (Read-Host "  Enter full path to the host list .txt file").Trim()
-
-    # Strip surrounding quotes that Windows sometimes adds when copy-pasting paths
-    $raw = $raw.Trim('"').Trim("'")
-
-    if ([string]::IsNullOrWhiteSpace($raw)) {
-        Write-Host "  Path cannot be empty. Please try again." -ForegroundColor Yellow
-        continue
-    }
-
-    if (-not (Test-Path -LiteralPath $raw -PathType Leaf)) {
-        Write-Host "  File not found: '$raw'" -ForegroundColor Yellow
-        Write-Host "  Please check the path and try again." -ForegroundColor Yellow
-        continue
-    }
-
-    $hostFilePath = $raw
-}
-
-$targetEsxiHosts = Get-Content -LiteralPath $hostFilePath |
-    Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' }
-
-if (-not $targetEsxiHosts) {
-    Write-Warning "Host list is empty. Exiting."
-    Stop-Transcript
-    exit 1
-}
-
-Write-Host "  Loaded $($targetEsxiHosts.Count) host(s) from: $hostFilePath" -ForegroundColor Cyan
+Write-Log ""
 
 #endregion
 #region --- Per-Host Processing ---
@@ -1576,10 +1652,10 @@ foreach ($esxiHost in $targetEsxiHosts) {
 
     $script:hostTimedOut = $false
 
-    Write-Host ("`n" + ("=" * 60)) -ForegroundColor Cyan
-    Write-Host ("  Processing host : $esxiHost") -ForegroundColor Cyan
-    Write-Host ("  " + $ScriptMeta.Blog) -ForegroundColor DarkGray
-    Write-Host ("=" * 60) -ForegroundColor Cyan
+    Write-Log ("`n" + ("=" * 60)) -Color DarkCyan
+    Write-Log ("  Processing host : $esxiHost")
+    Write-Log ("  " + $ScriptMeta.Blog) -Color DarkGray
+    Write-Log ("=" * 60) -Color DarkCyan
 
     $hostResult = [PSCustomObject]@{
         Host              = $esxiHost
@@ -1600,73 +1676,75 @@ foreach ($esxiHost in $targetEsxiHosts) {
 
     try {
         # --- DNS Validation (before connect, so issues are visible even if host is unreachable) ---
-        Write-Host "`n  [DNS Validation]" -ForegroundColor Cyan
+        Write-Log "`n  [DNS Validation]"
         if ($DryRun) {
-            Write-Host "  [DRY RUN] Would validate forward and reverse DNS for $esxiHost." -ForegroundColor DarkYellow
+            Write-Log "  [DRY RUN] Would validate forward and reverse DNS for $esxiHost." -Color DarkYellow
             $hostResult.DNS = "OK"
         } else {
             $dnsCheck = Test-DNSResolution -VMHost $esxiHost
             $hostResult.DNS = $dnsCheck.Status
             if ($dnsCheck.Status -eq "OK") {
-                Write-Host "  Forward : $($dnsCheck.Forward)" -ForegroundColor Green
-                Write-Host "  Reverse : $($dnsCheck.Reverse)" -ForegroundColor Green
-                Write-Host "  DNS OK -- forward and reverse match." -ForegroundColor Green
+                Write-Log "  Forward : $($dnsCheck.Forward)" -Color Green
+                Write-Log "  Reverse : $($dnsCheck.Reverse)" -Color Green
+                Write-Log "  DNS OK -- forward and reverse match." -Color Green
             } elseif ($dnsCheck.Status -eq "FAILED") {
-                Write-Host "  Forward lookup failed for $esxiHost." -ForegroundColor Red
-                Write-Host "  ACTION REQUIRED: Ensure an A record exists for this host." -ForegroundColor Red
+                Write-Log "  Forward lookup failed for $esxiHost." -Level ERROR
+                Write-Log "  ACTION REQUIRED: Ensure an A record exists for this host." -Level ERROR
+                throw "DNS A record lookup failed for $esxiHost. Fix DNS before commissioning."
             } else {
-                Write-Host "  Forward : $($dnsCheck.Forward)" -ForegroundColor Yellow
-                Write-Host "  Reverse : $($dnsCheck.Reverse)" -ForegroundColor Yellow
-                Write-Host "  WARNING: $($dnsCheck.Status)" -ForegroundColor Yellow
-                Write-Host "  ACTION REQUIRED: Fix PTR record before commissioning." -ForegroundColor Yellow
+                Write-Log "  Forward : $($dnsCheck.Forward)" -Level WARN
+                Write-Log "  Reverse : $($dnsCheck.Reverse)" -Level WARN
+                Write-Log "  WARNING: $($dnsCheck.Status)" -Level WARN
+                Write-Log "  ACTION REQUIRED: Fix PTR record before commissioning." -Level WARN
             }
         }
 
         # --- Connect ---
-        Write-Host "`n  [Connect]" -ForegroundColor Cyan
+        Write-Log "`n  [Connect]"
         if ($DryRun) {
-            Write-Host "`n  [DRY RUN] Would connect to $esxiHost as 'root'." -ForegroundColor DarkYellow
-            $hostResult.Connected = $true
+            Write-Log "`n  [DRY RUN] Would connect to $esxiHost as 'root'." -Color DarkYellow
+            $hostResult.Connected   = $true
+            $hostResult.StorageType = "Skipped"
         } else {
             Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
             $hostResult.Connected = $true
-            Write-Host "  Connected to $esxiHost." -ForegroundColor Green
+            Write-Log "  Connected to $esxiHost." -Color Green
             $vmHostObj = Get-VMHost -Name $esxiHost -ErrorAction Stop
 
             # Detect storage type immediately after connect while session is live
-            Write-Host "`n  [Storage Detection]" -ForegroundColor Cyan
+            Write-Log "`n  [Storage Detection]"
             $hostResult.StorageType = Get-ESXiStorageType -VMHostObj $vmHostObj
         }
 
         # --- WhatIfReport: cert/thumbprint read only, skip all other steps ---
         if ($WhatIfReport) {
-            Write-Host "`n  [WhatIfReport] Reading certificate..." -ForegroundColor Cyan
+            Write-Log "`n  [WhatIfReport] Reading certificate..."
             $certCheck = Test-ESXiCertificateNeedsRegen -VMHost $esxiHost
             $hostResult.Thumbprint = $certCheck.Thumbprint
             $hostResult.Expiry     = $certCheck.Expiry
             $hostResult.CertRegen  = if ($certCheck.NeedsRegen) { "Regen needed" } else { "OK" }
-            Write-Host "  Thumbprint   : $($certCheck.Thumbprint)" -ForegroundColor DarkGray
-            Write-Host "  CN           : $($certCheck.CN)"         -ForegroundColor DarkGray
-            Write-Host "  Expiry       : $($certCheck.Expiry)"     -ForegroundColor DarkGray
-            Write-Host "  Storage type : $($hostResult.StorageType)  (edit CSV to VSAN_ESA or VVOL if needed)" -ForegroundColor DarkGray
+            Write-Log "  Thumbprint   : $($certCheck.Thumbprint)" -Color DarkGray
+            Write-Log "  CN           : $($certCheck.CN)"         -Color DarkGray
+            Write-Log "  Expiry       : $($certCheck.Expiry)"     -Color DarkGray
+            Write-Log "  Storage type : $($hostResult.StorageType)  (edit CSV to VSAN_ESA or VVOL if needed)" -Color DarkGray
             # Skip all remaining steps  --  fall through to finally for clean disconnect
         } else {
 
         # --- NTP ---
-        Write-Host "`n  [NTP]" -ForegroundColor Cyan
+        Write-Log "`n  [NTP]"
         try {
             if ($DryRun) {
-                Write-Host "  [DRY RUN] Would verify/add NTP server(s): $($NtpServers -join ', ')." -ForegroundColor DarkYellow
-                Write-Host "  [DRY RUN] Would ensure ntpd policy=on and service running." -ForegroundColor DarkYellow
+                Write-Log "  [DRY RUN] Would verify/add NTP server(s): $($NtpServers -join ', ')." -Color DarkYellow
+                Write-Log "  [DRY RUN] Would ensure ntpd policy=on and service running." -Color DarkYellow
             } else {
                 $currentNtp     = @(Get-VMHostNtpServer -VMHost $vmHostObj)
                 $missingServers = $NtpServers | Where-Object { $_ -notin $currentNtp }
 
                 if ($missingServers) {
-                    Write-Host "  Adding missing NTP server(s): $($missingServers -join ', ')" -ForegroundColor Yellow
+                    Write-Log "  Adding missing NTP server(s): $($missingServers -join ', ')" -Level WARN
                     Add-VMHostNtpServer -VMHost $vmHostObj -NtpServer $missingServers -Confirm:$false -ErrorAction Stop | Out-Null
                 } else {
-                    Write-Host "  All required NTP server(s) already configured." -ForegroundColor Green
+                    Write-Log "  All required NTP server(s) already configured." -Color Green
                 }
 
                 Set-VMHostServiceConfig -VMHost $vmHostObj -ServiceKey "ntpd"
@@ -1674,44 +1752,44 @@ foreach ($esxiHost in $targetEsxiHosts) {
             $hostResult.NTP = "OK"
         } catch {
             $hostResult.NTP = "FAILED: $_"
-            Write-Warning "  NTP configuration failed: $_"
+            Write-Log "  NTP configuration failed: $_" -Level WARN
         }
 
         # --- Advanced Settings (SDDC Manager) ---
-        Write-Host "`n  [Advanced Settings]" -ForegroundColor Cyan
+        Write-Log "`n  [Advanced Settings]"
         try {
             if ($DryRun) {
-                Write-Host "  [DRY RUN] Would set 'Config.HostAgent.ssl.keyStore.allowSelfSigned' = True" -ForegroundColor DarkYellow
+                Write-Log "  [DRY RUN] Would set 'Config.HostAgent.ssl.keyStore.allowSelfSigned' = True" -Color DarkYellow
             } else {
                 Get-AdvancedSetting -Entity $vmHostObj -Name "Config.HostAgent.ssl.keyStore.allowSelfSigned" |
                     Set-AdvancedSetting -Value $true -Confirm:$false | Out-Null
-                Write-Host "  Set 'Config.HostAgent.ssl.keyStore.allowSelfSigned' = True" -ForegroundColor Green
+                Write-Log "  Set 'Config.HostAgent.ssl.keyStore.allowSelfSigned' = True" -Color Green
             }
             $hostResult.AdvancedSettings = "OK"
         } catch {
             $hostResult.AdvancedSettings = "FAILED: $_"
-            Write-Warning "  Advanced settings failed: $_"
+            Write-Log "  Advanced settings failed: $_" -Level WARN
         }
 
         # --- Optional Advanced Settings ---
         $enabledOptional = $OptionalAdvancedSettings | Where-Object { $_.Enabled -eq $true }
         if ($enabledOptional) {
-            Write-Host "`n  [Optional Advanced Settings]" -ForegroundColor Cyan
+            Write-Log "`n  [Optional Advanced Settings]"
             $optionalFailures = [System.Collections.Generic.List[string]]::new()
 
             foreach ($setting in $enabledOptional) {
                 try {
                     if ($DryRun) {
-                        Write-Host "  [DRY RUN] Would set '$($setting.Name)' = $($setting.Value)  ($($setting.Label))" -ForegroundColor DarkYellow
+                        Write-Log "  [DRY RUN] Would set '$($setting.Name)' = $($setting.Value)  ($($setting.Label))" -Color DarkYellow
                     } else {
                         Get-AdvancedSetting -Entity $vmHostObj -Name $setting.Name |
                             Set-AdvancedSetting -Value $setting.Value -Confirm:$false | Out-Null
-                        Write-Host "  Set '$($setting.Name)' = $($setting.Value)  ($($setting.Label))" -ForegroundColor Green
+                        Write-Log "  Set '$($setting.Name)' = $($setting.Value)  ($($setting.Label))" -Color Green
                     }
                 } catch {
                     $msg = "$($setting.Label): $_"
                     $optionalFailures.Add($msg)
-                    Write-Warning "  Failed to set '$($setting.Name)': $_"
+                    Write-Log "  Failed to set '$($setting.Name)': $_" -Level WARN
                 }
             }
 
@@ -1748,21 +1826,16 @@ foreach ($esxiHost in $targetEsxiHosts) {
         }
 
         # --- Certificate Regeneration ---
-        Write-Host "`n  [Certificate Regeneration]" -ForegroundColor Cyan
+        Write-Log "`n  [Certificate Regeneration]"
         try {
             if ($DryRun) {
-                Write-Host "  [DRY RUN] Would check if certificate CN matches hostname." -ForegroundColor DarkYellow
-                Write-Host "  [DRY RUN] Would regenerate host certificate if needed." -ForegroundColor DarkYellow
-                Write-Host "  [DRY RUN] Would reboot host and wait for it to come back online." -ForegroundColor DarkYellow
+                Write-Log "  [DRY RUN] Would check if certificate CN matches hostname." -Color DarkYellow
+                Write-Log "  [DRY RUN] Would regenerate host certificate if needed." -Color DarkYellow
+                Write-Log "  [DRY RUN] Would reboot host and wait for it to come back online." -Color DarkYellow
                 $hostResult.CertRegen = "OK"
                 $hostResult.Rebooted  = "OK"
-            } elseif (-not $script:PoshSSHAvailable) {
-                Write-Host "  Posh-SSH not available. Certificate regeneration skipped." -ForegroundColor Yellow
-                Write-Host "  ACTION REQUIRED: Manually run on this host and then reboot:" -ForegroundColor Yellow
-                Write-Host "    /sbin/generate-certificates" -ForegroundColor Cyan
-                $hostResult.CertRegen = "Manual"
-                $hostResult.Rebooted  = "Manual"
             } else {
+                # Always read cert thumbprint and expiry -- no Posh-SSH required
                 $certCheck = Test-ESXiCertificateNeedsRegen -VMHost $esxiHost
                 $hostResult.Thumbprint = $certCheck.Thumbprint
                 $hostResult.Expiry     = $certCheck.Expiry
@@ -1770,7 +1843,28 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 if (-not $certCheck.NeedsRegen) {
                     $hostResult.CertRegen = "Skipped"
                     $hostResult.Rebooted  = "Skipped"
+                } elseif (-not $script:PoshSSHAvailable) {
+                    Write-Log "  Posh-SSH not available. Certificate regeneration skipped." -Level WARN
+                    Write-Log "  ACTION REQUIRED: Manually run on this host and then reboot:" -Level WARN
+                    Write-Log "    /sbin/generate-certificates"
+                    $hostResult.CertRegen = "Manual"
+                    $hostResult.Rebooted  = "Manual"
                 } else {
+                    # Verify the ESXi configured hostname matches the FQDN from the
+                    # hosts file before attempting regen -- generate-certificates uses
+                    # the host's own configured FQDN, so a hostname mismatch means
+                    # regen would produce the same wrong CN and the reboot is wasted.
+                    $hostNet  = Get-VMHostNetwork -VMHost $vmHostObj
+                    $esxiFqdn = "$($hostNet.HostName).$($hostNet.DomainName)".ToLower().TrimEnd('.')
+                    if ($esxiFqdn -ne $esxiHost.ToLower()) {
+                        Write-Log "  ESXi hostname '$esxiFqdn' does not match expected FQDN '$esxiHost'." -Level WARN
+                        Write-Log "  Certificate regeneration skipped: fix the ESXi hostname first or" -Level WARN
+                        Write-Log "  the regenerated certificate will still have the wrong CN." -Level WARN
+                        $hostResult.CertRegen = "CN mismatch"
+                        $hostResult.Rebooted  = "Skipped"
+                        $hostResult.Error     = "ESXi hostname '$esxiFqdn' does not match '$esxiHost' -- correct the hostname before commissioning."
+                    } else {
+
                     $certRegenSuccess = Invoke-ESXiCertificateRegen `
                         -VMHost     $esxiHost `
                         -VMHostObj  $vmHostObj `
@@ -1781,31 +1875,38 @@ foreach ($esxiHost in $targetEsxiHosts) {
 
                         # Disconnect cleanly before reboot
                         Disconnect-VIServer -Server $esxiHost -Confirm:$false -ErrorAction SilentlyContinue
-                        Write-Host "  Disconnected. Initiating reboot of $esxiHost..." -ForegroundColor Yellow
+                        Write-Log "  Disconnected. Initiating reboot of $esxiHost..." -Level WARN
 
                         # Reconnect temporarily to issue the reboot command
                         Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
                         $rebootHostObj = Get-VMHost -Name $esxiHost -ErrorAction Stop
                         Restart-VMHost -VMHost $rebootHostObj -Confirm:$false -Force -ErrorAction Stop | Out-Null
                         Disconnect-VIServer -Server $esxiHost -Confirm:$false -ErrorAction SilentlyContinue
-                        Write-Host "  Reboot issued. Waiting for host to come back online..." -ForegroundColor Yellow
+                        Write-Log "  Reboot issued. Waiting for host to come back online..." -Level WARN
 
                         # Wait for the host to come back (throws on timeout)
                         Wait-ESXiHostOnline -VMHost $esxiHost
                         $hostResult.Rebooted = "OK"
 
                         # Reconnect for remaining steps (password reset)
-                        Write-Host "  Reconnecting to $esxiHost..." -ForegroundColor Cyan
+                        Write-Log "  Reconnecting to $esxiHost..."
                         Connect-VIServer -Server $esxiHost -Credential $esxiCredentials -ErrorAction Stop | Out-Null
                         $vmHostObj = Get-VMHost -Name $esxiHost -ErrorAction Stop
-                        Write-Host "  Reconnected to $esxiHost." -ForegroundColor Green
+                        Write-Log "  Reconnected to $esxiHost." -Color Green
 
-                        # Re-read thumbprint from the newly regenerated certificate
-                        Write-Host "  Reading new certificate thumbprint..." -ForegroundColor Cyan
+                        # Re-read cert -- verify CN now matches and capture new thumbprint
+                        Write-Log "  Reading new certificate thumbprint..."
                         $newCertCheck = Test-ESXiCertificateNeedsRegen -VMHost $esxiHost
                         $hostResult.Thumbprint = $newCertCheck.Thumbprint
                         $hostResult.Expiry     = $newCertCheck.Expiry
+                        if ($newCertCheck.NeedsRegen) {
+                            $hostResult.CertRegen = "CN mismatch"
+                            $hostResult.Error     = "Certificate CN '$($newCertCheck.CN)' still does not match '$esxiHost' after regeneration -- correct the ESXi hostname before commissioning."
+                            Write-Log "  WARNING: Certificate CN still does not match hostname after regeneration." -Level WARN
+                            Write-Log "  CN: $($newCertCheck.CN)  --  Expected: $esxiHost" -Level WARN
+                        }
                     }
+                    } # end hostname-matches-fqdn check
                 }
             }
         } catch {
@@ -1815,24 +1916,24 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 $hostResult.Rebooted  = "Timeout"  # host never came back
                 $hostResult.Error     = "Host did not come back online after reboot within the timeout period. Check the host console for hardware or boot errors."
                 $script:hostTimedOut  = $true
-                Write-Host ""
-                Write-Host ("  " + ("!" * 58)) -ForegroundColor Red
-                Write-Host "  !! REBOOT TIMEOUT: $esxiHost did not come back online !!" -ForegroundColor Red
-                Write-Host "  !! Check the host console for hardware or boot errors. !!" -ForegroundColor Red
-                Write-Host ("  " + ("!" * 58)) -ForegroundColor Red
-                Write-Host ""
+                Write-Log ""
+                Write-Log ("  " + ("!" * 58)) -Level ERROR
+                Write-Log "  !! REBOOT TIMEOUT: $esxiHost did not come back online !!" -Level ERROR
+                Write-Log "  !! Check the host console for hardware or boot errors. !!" -Level ERROR
+                Write-Log ("  " + ("!" * 58)) -Level ERROR
+                Write-Log ""
             } else {
                 $hostResult.CertRegen = "FAILED: $_"
-                Write-Warning "  Certificate regeneration/reboot failed: $_"
+                Write-Log "  Certificate regeneration/reboot failed: $_" -Level WARN
             }
         }
 
         # --- Password Reset (always last) ---
         if ($ResetPassword) {
-            Write-Host "`n  [Password Reset]" -ForegroundColor Cyan
+            Write-Log "`n  [Password Reset]"
             try {
                 if ($DryRun) {
-                    Write-Host "  [DRY RUN] Would reset password for 'root'." -ForegroundColor DarkYellow
+                    Write-Log "  [DRY RUN] Would reset password for 'root'." -Color DarkYellow
                     $hostResult.PasswordReset = "OK"
                 } else {
                     Reset-ESXiAccountPassword `
@@ -1843,7 +1944,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 }
             } catch {
                 $hostResult.PasswordReset = "FAILED: $_"
-                Write-Warning "  Password reset failed: $_"
+                Write-Log "  Password reset failed: $_" -Level WARN
             }
         }
 
@@ -1851,18 +1952,18 @@ foreach ($esxiHost in $targetEsxiHosts) {
 
     } catch {
         $hostResult.Error = $_.Exception.Message
-        Write-Warning "  Failed to process host '$esxiHost': $_"
+        Write-Log "  Failed to process host '$esxiHost': $_" -Level WARN
     } finally {
         if ($hostResult.Connected -and -not $DryRun) {
             if ($script:hostTimedOut) {
                 # Host never came back  --  skip disconnect, it will just throw a noisy error
-                Write-Host "`n  Host is unreachable  --  skipping disconnect." -ForegroundColor DarkGray
+                Write-Log "`n  Host is unreachable  --  skipping disconnect." -Color DarkGray
             } else {
                 Disconnect-VIServer -Server $esxiHost -Confirm:$false -ErrorAction SilentlyContinue
-                Write-Host "`n  Disconnected from $esxiHost." -ForegroundColor Gray
+                Write-Log "`n  Disconnected from $esxiHost." -Color Gray
             }
         } elseif ($DryRun) {
-            Write-Host "`n  [DRY RUN] Would disconnect from $esxiHost." -ForegroundColor DarkYellow
+            Write-Log "`n  [DRY RUN] Would disconnect from $esxiHost." -Color DarkYellow
         }
     }
 
@@ -1878,27 +1979,27 @@ $summaryColumnWidths = @(34, 11, 14, 6, 17, 17, 14, 10, 10, 15, 28)
 $summaryWidth = ($summaryColumnWidths | Measure-Object -Sum).Sum + ($summaryColumnWidths.Count * 3) + 1
 
 
-Write-Host ""
-Write-Host ("=" * $summaryWidth) -ForegroundColor DarkCyan
-Write-Host ("  SUMMARY  -  {0} host(s) processed  --  {1}" -f $results.Count, $ScriptMeta.Blog) -ForegroundColor Cyan
-Write-Host ("=" * $summaryWidth) -ForegroundColor DarkCyan
+Write-Log ""
+Write-Log ("=" * $summaryWidth) -Color DarkCyan
+Write-Log ("  SUMMARY  -  {0} host(s) processed  --  {1}" -f $results.Count, $ScriptMeta.Blog)
+Write-Log ("=" * $summaryWidth) -Color DarkCyan
 
 Write-ColorSummaryTable -Data $results
 
 # Legend
-Write-Host ""
-Write-Host "  Legend: " -NoNewline -ForegroundColor White
-Write-Host "OK  "      -NoNewline -ForegroundColor Green
-Write-Host "FAILED  "  -NoNewline -ForegroundColor Red
-Write-Host "Timeout  " -NoNewline -ForegroundColor Red
-Write-Host "Skipped  " -NoNewline -ForegroundColor DarkGray
-Write-Host "Manual  "  -NoNewline -ForegroundColor Yellow
-Write-Host "Partial  " -NoNewline -ForegroundColor Yellow
-Write-Host "Warning"               -ForegroundColor Yellow
-Write-Host ""
-Write-Host ("  Log written to    : {0}" -f $LogPath) -ForegroundColor DarkGray
+Write-Log ""
+Write-Log "  Legend: " -Color White -NoNewline
+Write-Log "OK  "      -Color Green   -NoNewline
+Write-Log "FAILED  "  -Level ERROR   -NoNewline
+Write-Log "Timeout  " -Level ERROR   -NoNewline
+Write-Log "Skipped  " -Color DarkGray -NoNewline
+Write-Log "Manual  "  -Level WARN    -NoNewline
+Write-Log "Partial  " -Level WARN    -NoNewline
+Write-Log "Warning"   -Level WARN
+Write-Log ""
+Write-Log ("  Log written to    : {0}" -f $LogPath) -Color DarkGray
 
-Write-HtmlReport -Data $results -ReportPath $ReportPath
+Write-HtmlReport -Data $results -ReportPath $ReportPath -WhatIfReport:$WhatIfReport
 
 # Export commissioning CSV for use by Commission-VCFHosts.ps1
 # Only includes hosts that connected successfully and have a valid thumbprint
@@ -1910,15 +2011,13 @@ $csvRows = $results | Where-Object { $_.Connected -eq $true -and $_.Thumbprint -
 
 if ($csvRows) {
     $csvRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-    Write-Host ("  Commissioning CSV : {0}" -f $CsvPath) -ForegroundColor Cyan
-    Write-Host ("  {0} host(s) exported to CSV." -f @($csvRows).Count) -ForegroundColor DarkGray
+    Write-Log ("  Commissioning CSV : {0}" -f $CsvPath)
+    Write-Log ("  {0} host(s) exported to CSV." -f @($csvRows).Count) -Color DarkGray
 } else {
-    Write-Host "  No hosts with valid thumbprints  --  CSV not written." -ForegroundColor Yellow
+    Write-Log "  No hosts with valid thumbprints  --  CSV not written." -Level WARN
 }
 
-Write-Host ("=" * $summaryWidth) -ForegroundColor DarkCyan
-Write-Host ""
-
-Stop-Transcript
+Write-Log ("=" * $summaryWidth) -Color DarkCyan
+Write-Log ""
 
 #endregion
