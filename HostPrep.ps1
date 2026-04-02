@@ -1070,9 +1070,8 @@ function Invoke-VSANDiskWipe {
         }
     }
 
-    Write-Host ("  Boot device(s) excluded from wipe: {0}" -f (
-        if ($bootDevices.Count -gt 0) { ($bootDevices | Sort-Object) -join ', ' } else { 'none detected' }
-    )) -ForegroundColor DarkGray
+    $bootDeviceList = if ($bootDevices.Count -gt 0) { ($bootDevices | Sort-Object) -join ', ' } else { 'none detected' }
+    Write-Host ("  Boot device(s) excluded from wipe: {0}" -f $bootDeviceList) -ForegroundColor DarkGray
 
     # --- Find non-boot disks with existing partition tables ---
     $disksToWipe = [System.Collections.Generic.List[PSCustomObject]]::new()
