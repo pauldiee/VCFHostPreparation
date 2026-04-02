@@ -97,7 +97,7 @@
     One or more NTP server addresses. Defaults to 'pool.ntp.org'.
 
 .PARAMETER LogPath
-    Path to write the transcript log. Defaults to the Desktop.
+    Path to write the transcript log. Defaults to the script directory.
 
 .PARAMETER DryRun
     Simulates all steps without making any changes. All actions are logged
@@ -249,7 +249,7 @@ param (
     [switch]$WhatIfReport,
 
     [string]$LogPath = [System.IO.Path]::Combine(
-        [Environment]::GetFolderPath('Desktop'),
+        $PSScriptRoot,
         "HostPrep_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     ),
 
