@@ -219,19 +219,19 @@
                 List[string] indexing behaviour; passing hosts now show PASS
                 badge only with no extra detail; FAIL rows still show the full
                 error message
-        3.1.2 - SDDC Manager username prompt now defaults to
-                administrator@vsphere.local; press Enter to accept
-        3.1.1 - Fixed per-host effective status fallthrough: hosts with
-                UNKNOWN or IN_PROGRESS resultStatus no longer show as PASS;
-                only an explicit SUCCEEDED maps to PASS
-        3.1.0 - Validation timeout increased from 5 to 10 minutes; UNKNOWN
-                resultStatus no longer treated as PASSED -- only SUCCEEDED
-                maps to PASSED; any other status including UNKNOWN now
-                shows as UNKNOWN (grey) and blocks commissioning
         3.0.1 - Gated ICertificatePolicy Add-Type block behind PS version check
                 (Major -lt 6); ICertificatePolicy was removed in .NET 6 and
                 caused a CS0246 compile error on PowerShell 7+; PS 6+ already
                 uses -SkipCertificateCheck per Invoke-RestMethod call
+        3.1.0 - Validation timeout increased from 5 to 10 minutes; UNKNOWN
+                resultStatus no longer treated as PASSED -- only SUCCEEDED
+                maps to PASSED; any other status including UNKNOWN now
+                shows as UNKNOWN (grey) and blocks commissioning
+        3.1.1 - Fixed per-host effective status fallthrough: hosts with
+                UNKNOWN or IN_PROGRESS resultStatus no longer show as PASS;
+                only an explicit SUCCEEDED maps to PASS
+        3.1.2 - SDDC Manager username prompt now defaults to
+                administrator@vsphere.local; press Enter to accept
         3.0.0 - Added TLS certificate bypass for SDDC Manager self-signed/
                 internal CA certs: PS 5.1 uses TrustAllCertsPolicy + TLS 1.2;
                 PS 6+ uses -SkipCertificateCheck on Invoke-RestMethod; fixed
