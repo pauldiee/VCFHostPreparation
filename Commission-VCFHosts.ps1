@@ -237,11 +237,11 @@
         3.1.1 - Fixed per-host effective status fallthrough: hosts with
                 UNKNOWN or IN_PROGRESS resultStatus no longer show as PASS;
                 only an explicit SUCCEEDED maps to PASS
+        3.1.2 - SDDC Manager username prompt now defaults to
+                administrator@vsphere.local; press Enter to accept
         3.1.3 - Added maintenance mode check before validation: queries each
                 host via ESXi SOAP API; if any are in maintenance mode the
                 user is prompted to exit maintenance mode before proceeding
-        3.1.2 - SDDC Manager username prompt now defaults to
-                administrator@vsphere.local; press Enter to accept
 #>
 
 [CmdletBinding()]
