@@ -115,7 +115,7 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 3.1.1
+    Version : 3.1.2
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-04-02
@@ -219,6 +219,8 @@
                 List[string] indexing behaviour; passing hosts now show PASS
                 badge only with no extra detail; FAIL rows still show the full
                 error message
+        3.1.2 - SDDC Manager username prompt now defaults to
+                administrator@vsphere.local; press Enter to accept
         3.1.1 - Fixed per-host effective status fallthrough: hosts with
                 UNKNOWN or IN_PROGRESS resultStatus no longer show as PASS;
                 only an explicit SUCCEEDED maps to PASS
@@ -273,7 +275,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "Commission-VCFHosts.ps1"
-    Version = "3.1.1"
+    Version = "3.1.2"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-20"
@@ -1152,7 +1154,8 @@ if (-not $SddcManager) {
 Write-Host ""
 Write-Host "  Authenticating to SDDC Manager: $SddcManager" -ForegroundColor Cyan
 
-$sddcUser     = Read-Host "  SDDC Manager username (e.g. administrator@vsphere.local)"
+$sddcUserInput = Read-Host "  SDDC Manager username [administrator@vsphere.local]"
+$sddcUser      = if ($sddcUserInput.Trim() -eq "") { "administrator@vsphere.local" } else { $sddcUserInput.Trim() }
 $sddcPassword = Read-Host "  SDDC Manager password" -AsSecureString
 $sddcCred     = New-Object System.Management.Automation.PSCredential($sddcUser, $sddcPassword)
 
