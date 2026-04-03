@@ -219,6 +219,13 @@
                 List[string] indexing behaviour; passing hosts now show PASS
                 badge only with no extra detail; FAIL rows still show the full
                 error message
+        3.0.0 - Added TLS certificate bypass for SDDC Manager self-signed/
+                internal CA certs: PS 5.1 uses TrustAllCertsPolicy + TLS 1.2;
+                PS 6+ uses -SkipCertificateCheck on Invoke-RestMethod; fixed
+                host commission payload always serialised as a JSON array by
+                wrapping foreach in @() and switching ConvertTo-Json to use
+                -InputObject (pipeline unroll caused single-host runs to send
+                an object instead of array, resulting in HTTP 400)
         3.0.1 - Gated ICertificatePolicy Add-Type block behind PS version check
                 (Major -lt 6); ICertificatePolicy was removed in .NET 6 and
                 caused a CS0246 compile error on PowerShell 7+; PS 6+ already
@@ -232,13 +239,6 @@
                 only an explicit SUCCEEDED maps to PASS
         3.1.2 - SDDC Manager username prompt now defaults to
                 administrator@vsphere.local; press Enter to accept
-        3.0.0 - Added TLS certificate bypass for SDDC Manager self-signed/
-                internal CA certs: PS 5.1 uses TrustAllCertsPolicy + TLS 1.2;
-                PS 6+ uses -SkipCertificateCheck on Invoke-RestMethod; fixed
-                host commission payload always serialised as a JSON array by
-                wrapping foreach in @() and switching ConvertTo-Json to use
-                -InputObject (pipeline unroll caused single-host runs to send
-                an object instead of array, resulting in HTTP 400)
 #>
 
 [CmdletBinding()]
