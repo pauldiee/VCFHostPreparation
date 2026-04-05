@@ -1,0 +1,13 @@
+# HostPrep runtime output
+HostPrep_*.log
+HostPrep_*.csv
+HostPrep_*.html
+
+# Commission runtime output
+Commission_*.log
+Commission_*.csv
+Commission_*.html
+Commission_*.json
+
+# Host list files
+testhost.txt
