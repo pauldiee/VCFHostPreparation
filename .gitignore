@@ -11,6 +11,7 @@ Commission_*.json
 
 # Host list files
 testhost.txt
+host.txt
 
 # Blog post drafts (local only)
 blogpost*.html
