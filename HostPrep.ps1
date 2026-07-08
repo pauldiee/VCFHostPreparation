@@ -82,11 +82,12 @@
 
         Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 
-    SSH authentication uses a throwaway ed25519 keypair generated per run;
-    the public key is installed on each host over HTTPS (no manual key setup
-    needed) and removed again when the host's SSH steps finish. Without the
-    OpenSSH client the script will print per-host manual instructions for
-    the certificate and disk wipe steps instead of failing.
+    SSH authenticates with the root password through ssh.exe's SSH_ASKPASS
+    helper (no external module, no key setup). ESXi 9 removed the HTTPS
+    endpoint earlier versions used to install a public key, so password auth
+    over the built-in client is used instead. Without the OpenSSH client the
+    script will print per-host manual instructions for the certificate and
+    disk wipe steps instead of failing.
 
     VCF 9 Password Requirements
     ---------------------------
@@ -151,7 +152,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 4.1.0
+    Version : 4.1.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-08
@@ -302,6 +303,12 @@
                 host's SSH steps, commands run via ssh.exe with a temp
                 known_hosts file, and the keypair is deleted at end of run.
                 No external module dependencies remain. (GitHub issue #3)
+        4.1.1 - ESXi 9 removed the /host/ssh_root_authorized_keys endpoint, so
+                the HTTPS key-install (used by cert regen and -WipeDisk) failed
+                with 404. Replaced key auth with root-password auth over the
+                same built-in ssh.exe via SSH_ASKPASS (keyboard-interactive);
+                ssh-keygen and the HTTPS PUT are gone. Still no external
+                module dependencies. (GitHub issue #3)
 #>
 
 [CmdletBinding()]
@@ -337,7 +344,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "4.1.0"
+    Version = "4.1.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-08"
@@ -504,12 +511,11 @@ Write-Log "HostPrep started at $(Get-Date)"
 # Verify the Windows OpenSSH client is available (needed for cert regen and
 # -WipeDisk  --  not relevant in WhatIfReport mode)
 $script:SSHClientAvailable = $false
-$script:HostPrepSSHKey     = $null
+$script:HostPrepSSHAuth    = $null
 if (-not $WhatIfReport) {
-    if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue) -or
-        -not (Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
         Write-Log ""
-        Write-Log "  WARNING: The Windows OpenSSH client (ssh.exe / ssh-keygen.exe) was not found." -Level WARN
+        Write-Log "  WARNING: The Windows OpenSSH client (ssh.exe) was not found." -Level WARN
         Write-Log "  Certificate regeneration and disk wipe will be skipped for all hosts." -Level WARN
         Write-Log "  To enable it, install the 'OpenSSH Client' optional Windows feature:" -Level WARN
         Write-Log "    Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0" -Level WARN
@@ -708,108 +714,81 @@ function Test-ESXiCertificateNeedsRegen {
     }
 }
 
-function Get-HostPrepSSHKey {
+function Get-HostPrepSSHAuth {
     <#
     .SYNOPSIS
-        Returns this run's throwaway SSH keypair, generating it on first use.
+        Returns this run's SSH askpass helper, creating it on first use.
 
     .DESCRIPTION
-        Generates a passphrase-less ed25519 keypair with ssh-keygen in a
-        run-specific temp folder and caches it in script scope. The same
-        keypair is reused for every host in the run; the public key is only
-        present on a host for the duration of its SSH operations and is
-        removed again afterwards. A temp known_hosts file lives alongside the
-        key so host keys never pollute the user's ~/.ssh/known_hosts.
-        The temp folder is deleted at the end of the run.
+        ESXi 9 removed the /host/ssh_root_authorized_keys HTTPS endpoint that
+        earlier versions used to install a public key, so SSH authenticates
+        with the root password instead. The built-in OpenSSH client (ssh.exe)
+        reads the password from an SSH_ASKPASS helper: a small .cmd that prints
+        a password file. Both live in a run-specific temp folder alongside a
+        temp known_hosts file so host keys never pollute the user's
+        ~/.ssh/known_hosts. The folder is deleted at the end of the run.
+
+        The password never appears on the command line or in the process list;
+        it sits only in the temp password file for the duration of the run.
+        The same helper is reused for every host in the run.
+
+    .PARAMETER Credential
+        PSCredential for the root account whose password drives the SSH login.
 
     .OUTPUTS
         PSCustomObject with:
-          .KeyDir         [string] - temp folder holding all key material
-          .PrivateKeyPath [string] - path to the private key for ssh -i
-          .PublicKey      [string] - public key line for authorized_keys
+          .KeyDir         [string] - temp folder holding all SSH material
+          .AskPassPath    [string] - SSH_ASKPASS helper (.cmd) path
           .KnownHostsPath [string] - temp known_hosts file for this run
     #>
-    if ($script:HostPrepSSHKey) { return $script:HostPrepSSHKey }
+    param (
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
+    )
+
+    if ($script:HostPrepSSHAuth) { return $script:HostPrepSSHAuth }
 
     $keyDir = Join-Path ([System.IO.Path]::GetTempPath()) ("HostPrep_ssh_" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
-    $privateKeyPath = Join-Path $keyDir "id_ed25519"
+    $pwFile      = Join-Path $keyDir "pw"
+    $askPassPath = Join-Path $keyDir "askpass.cmd"
 
-    # PowerShell 7.3+ passes empty-string arguments to native commands
-    # correctly; older versions drop them, so the empty passphrase must be
-    # smuggled through as a literal '""'.
-    $emptyPassphrase = if ($PSVersionTable.PSVersion -ge [version]'7.3') { "" } else { '""' }
-    & ssh-keygen -q -t ed25519 -C "HostPrep.ps1 temporary key" -f $privateKeyPath -N $emptyPassphrase 2>&1 | Out-Null
+    # Password file: raw bytes, no BOM, single trailing newline. The askpass
+    # .cmd simply 'type's it, so special characters in the password are emitted
+    # verbatim (cmd never parses the password itself).
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($pwFile, ($Credential.GetNetworkCredential().Password + "`n"), $utf8NoBom)
+    [System.IO.File]::WriteAllText($askPassPath, ("@type `"{0}`"`r`n" -f $pwFile), $utf8NoBom)
 
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$privateKeyPath.pub")) {
-        Remove-Item -Path $keyDir -Recurse -Force -ErrorAction SilentlyContinue
-        throw "ssh-keygen failed to generate a temporary keypair (exit code $LASTEXITCODE)."
-    }
-
-    $script:HostPrepSSHKey = [PSCustomObject]@{
+    $script:HostPrepSSHAuth = [PSCustomObject]@{
         KeyDir         = $keyDir
-        PrivateKeyPath = $privateKeyPath
-        PublicKey      = (Get-Content "$privateKeyPath.pub" -Raw).Trim()
+        AskPassPath    = $askPassPath
         KnownHostsPath = (Join-Path $keyDir "known_hosts")
     }
-    Write-Log "  Generated temporary SSH keypair for this run." -Color DarkGray
-    return $script:HostPrepSSHKey
-}
-
-function Set-ESXiRootAuthorizedKeys {
-    <#
-    .SYNOPSIS
-        Writes (or clears) root's authorized_keys on an ESXi host via HTTPS.
-
-    .DESCRIPTION
-        ESXi exposes root's authorized_keys file as an HTTPS endpoint
-        (/host/ssh_root_authorized_keys) that accepts PUT with the root
-        credentials, which makes it possible to install an SSH public key
-        before any SSH session exists. Putting an empty body clears the file
-        again. The host's self-signed certificate is accepted for this
-        request only.
-
-    .PARAMETER VMHost
-        FQDN of the ESXi host.
-
-    .PARAMETER Credential
-        PSCredential for the root account.
-
-    .PARAMETER Content
-        The authorized_keys content to write. An empty string (default)
-        clears the file.
-    #>
-    param (
-        [Parameter(Mandatory)][string]$VMHost,
-        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
-        [AllowEmptyString()][string]$Content = ""
-    )
-
-    $request = [System.Net.HttpWebRequest]::Create("https://$VMHost/host/ssh_root_authorized_keys")
-    $request.Method      = "PUT"
-    $request.ContentType = "text/plain"
-    $request.Timeout     = 30000
-    $request.ServerCertificateValidationCallback = [HostPrepTls]::TrustAll
-
-    $authPair = "{0}:{1}" -f $Credential.UserName, $Credential.GetNetworkCredential().Password
-    $request.Headers["Authorization"] = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($authPair))
-
-    $body = [Text.Encoding]::ASCII.GetBytes($Content)
-    $request.ContentLength = $body.Length
-    $requestStream = $request.GetRequestStream()
-    try {
-        $requestStream.Write($body, 0, $body.Length)
-    } finally {
-        $requestStream.Close()
-    }
-    $request.GetResponse().Close()
+    Write-Log "  Prepared temporary SSH credential helper for this run." -Color DarkGray
+    return $script:HostPrepSSHAuth
 }
 
 function Invoke-ESXiSSHCommand {
     <#
     .SYNOPSIS
         Runs a single command on an ESXi host using the built-in OpenSSH
-        client (ssh.exe) with this run's temporary keypair.
+        client (ssh.exe), authenticating with the root password via SSH_ASKPASS.
+
+    .DESCRIPTION
+        ESXi's sshd offers keyboard-interactive (not password) authentication,
+        so ssh.exe is told to prefer it and to read the password from the run's
+        SSH_ASKPASS helper. SSH_ASKPASS_REQUIRE=force makes ssh use the helper
+        even though a console is attached; pubkey auth is disabled so the login
+        does not stall trying the user's default keys first.
+
+    .PARAMETER VMHost
+        FQDN or hostname of the ESXi host.
+
+    .PARAMETER Command
+        The command to run on the host.
+
+    .PARAMETER Credential
+        PSCredential for the root account.
 
     .OUTPUTS
         PSCustomObject with:
@@ -819,23 +798,39 @@ function Invoke-ESXiSSHCommand {
     #>
     param (
         [Parameter(Mandatory)][string]$VMHost,
-        [Parameter(Mandatory)][string]$Command
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
     )
 
-    $sshKey  = Get-HostPrepSSHKey
+    $sshAuth = Get-HostPrepSSHAuth -Credential $Credential
     $sshArgs = @(
-        "-i", $sshKey.PrivateKeyPath
-        "-o", "BatchMode=yes"                       # never fall back to interactive password prompts
+        "-o", "PreferredAuthentications=keyboard-interactive,password"
+        "-o", "KbdInteractiveAuthentication=yes"    # ESXi sshd offers keyboard-interactive, not password
+        "-o", "PubkeyAuthentication=no"             # skip the user's default keys
         "-o", "StrictHostKeyChecking=accept-new"    # auto-accept unknown host keys
-        "-o", ("UserKnownHostsFile=`"{0}`"" -f $sshKey.KnownHostsPath)
+        "-o", ("UserKnownHostsFile=`"{0}`"" -f $sshAuth.KnownHostsPath)
         "-o", "ConnectTimeout=20"
+        "-o", "NumberOfPasswordPrompts=1"
         "root@$VMHost"
         $Command
     )
-    $output = & ssh.exe @sshArgs 2>&1 | ForEach-Object { "$_" }
+
+    # ssh.exe reads the password from the SSH_ASKPASS helper. Save and restore
+    # any pre-existing values so the run does not clobber the user's environment.
+    $savedAskPass = $env:SSH_ASKPASS
+    $savedRequire = $env:SSH_ASKPASS_REQUIRE
+    try {
+        $env:SSH_ASKPASS         = $sshAuth.AskPassPath
+        $env:SSH_ASKPASS_REQUIRE = "force"
+        $output   = & ssh.exe @sshArgs 2>&1 | ForEach-Object { "$_" }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        if ($null -eq $savedAskPass) { Remove-Item Env:\SSH_ASKPASS -ErrorAction SilentlyContinue }         else { $env:SSH_ASKPASS = $savedAskPass }
+        if ($null -eq $savedRequire) { Remove-Item Env:\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue } else { $env:SSH_ASKPASS_REQUIRE = $savedRequire }
+    }
 
     return [PSCustomObject]@{
-        ExitStatus = $LASTEXITCODE
+        ExitStatus = $exitCode
         Output     = @($output)
     }
 }
@@ -847,7 +842,7 @@ function Invoke-ESXiCertificateRegen {
 
     .DESCRIPTION
         - Enables SSH on the host via PowerCLI (Set-VMHostServiceConfig)
-        - Installs this run's temporary SSH public key via HTTPS
+        - Authenticates over SSH with the root password (SSH_ASKPASS)
         - Runs /sbin/generate-certificates using the built-in OpenSSH client
         - Removes the key and disables SSH again regardless of outcome
         - Returns $true on success, throws on failure
@@ -871,15 +866,9 @@ function Invoke-ESXiCertificateRegen {
     Write-Log "  Enabling SSH temporarily for certificate regeneration..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
 
-    $keyInstalled = $false
     try {
-        # Install the temporary public key over HTTPS, then run the command
-        Write-Log "  Installing temporary SSH public key via HTTPS..."
-        Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content (Get-HostPrepSSHKey).PublicKey
-        $keyInstalled = $true
-
         Write-Log "  Connecting via SSH to run /sbin/generate-certificates..."
-        $sshResult = Invoke-ESXiSSHCommand -VMHost $VMHost -Command "/sbin/generate-certificates"
+        $sshResult = Invoke-ESXiSSHCommand -VMHost $VMHost -Command "/sbin/generate-certificates" -Credential $Credential
 
         if ($sshResult.ExitStatus -ne 0) {
             throw "/sbin/generate-certificates exited with code $($sshResult.ExitStatus). Output: $($sshResult.Output -join ' ')"
@@ -889,15 +878,7 @@ function Invoke-ESXiCertificateRegen {
         return $true
 
     } finally {
-        # Always remove the temporary key and disable the service
-        if ($keyInstalled) {
-            try {
-                Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content ""
-                Write-Log "  Temporary SSH public key removed from $VMHost." -Color DarkGray
-            } catch {
-                Write-Log "  Could not remove temporary SSH key from ${VMHost}: $_" -Level WARN
-            }
-        }
+        # Always disable the service again regardless of outcome
         Write-Log "  Disabling SSH..." -Level WARN
         $svc = Get-VMHostService -VMHost $VMHostObj | Where-Object { $_.Key -eq "TSM-SSH" }
         if ($svc) {
@@ -1408,21 +1389,16 @@ function Invoke-VSANDiskWipe {
         Write-Log ("  VMFS extent check failed (non-fatal): {0}" -f $_) -Level WARN
     }
 
-    # --- Enable SSH temporarily, install temp key, then unmount VMFS and wipe ---
+    # --- Enable SSH temporarily, then unmount VMFS and wipe ---
     Write-Log "  Enabling SSH temporarily for disk wipe..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
 
     $wipedCount = 0
     $failedDisks = [System.Collections.Generic.List[string]]::new()
-    $keyInstalled = $false
 
     try {
-        Write-Log "  Installing temporary SSH public key via HTTPS..." -Color Cyan
-        Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content (Get-HostPrepSSHKey).PublicKey
-        $keyInstalled = $true
-
         Write-Log "  Connecting via SSH to run partedUtil..." -Color Cyan
-        $probe = Invoke-ESXiSSHCommand -VMHost $VMHost -Command "echo connected"
+        $probe = Invoke-ESXiSSHCommand -VMHost $VMHost -Command "echo connected" -Credential $Credential
         if ($probe.ExitStatus -ne 0) {
             throw ("SSH connection failed: {0}" -f (($probe.Output -join ' ').Trim()))
         }
@@ -1430,7 +1406,7 @@ function Invoke-VSANDiskWipe {
         # Layer 4: /proc/mounts bootbank check -- definitive boot device identification via SSH.
         # Runs after connectivity is verified; retroactively removes boot disk from wipe list if
         # it was missed by Layers 1-3 (e.g. nested ESXi where IsBootDrive flag is not set).
-        $mountResult = Invoke-ESXiSSHCommand -VMHost $VMHost `
+        $mountResult = Invoke-ESXiSSHCommand -VMHost $VMHost -Credential $Credential `
             -Command "grep ' /bootbank ' /proc/mounts"
         $bootMountRaw = ($mountResult.Output | Where-Object { $_ -match '/dev/disks/' } | Select-Object -First 1)
         if ($bootMountRaw) {
@@ -1451,7 +1427,7 @@ function Invoke-VSANDiskWipe {
         # Unmount VMFS volumes via SSH before wiping
         foreach ($volName in $vmfsToUnmount) {
             Write-Log ("  Unmounting VMFS datastore '{0}'..." -f $volName) -Level WARN
-            $umResult = Invoke-ESXiSSHCommand -VMHost $VMHost `
+            $umResult = Invoke-ESXiSSHCommand -VMHost $VMHost -Credential $Credential `
                 -Command ("esxcli storage filesystem unmount -l '{0}'" -f $volName)
             if ($umResult.ExitStatus -eq 0) {
                 Write-Log ("  Datastore '{0}' unmounted." -f $volName) -Color Green
@@ -1465,7 +1441,7 @@ function Invoke-VSANDiskWipe {
             try {
                 Write-Log ("  Wiping {0} ({1} GB)..." -f $disk.Device, $disk.SizeGB) -Level WARN
                 $cmd    = "partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device
-                $result = Invoke-ESXiSSHCommand -VMHost $VMHost -Command $cmd
+                $result = Invoke-ESXiSSHCommand -VMHost $VMHost -Command $cmd -Credential $Credential
 
                 if ($result.ExitStatus -eq 0) {
                     Write-Log ("  Wiped {0} successfully." -f $disk.Device) -Color Green
@@ -1489,14 +1465,6 @@ function Invoke-VSANDiskWipe {
             FailedDisks = @($disksToWipe | Select-Object -ExpandProperty Device)
         }
     } finally {
-        if ($keyInstalled) {
-            try {
-                Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content ""
-                Write-Log "  Temporary SSH public key removed from $VMHost." -Color DarkGray
-            } catch {
-                Write-Log "  Could not remove temporary SSH key from ${VMHost}: $_" -Level WARN
-            }
-        }
         Write-Log "  Disabling SSH..." -Level WARN
         $svc = Get-VMHostService -VMHost $VMHostObj | Where-Object { $_.Key -eq "TSM-SSH" }
         if ($svc) {
@@ -2306,11 +2274,11 @@ if ($csvRows) {
     Write-Log "  No hosts with valid thumbprints  --  CSV not written." -Level WARN
 }
 
-# Remove the throwaway SSH keypair generated for this run (if any)
-if ($script:HostPrepSSHKey) {
-    Remove-Item -Path $script:HostPrepSSHKey.KeyDir -Recurse -Force -ErrorAction SilentlyContinue
-    $script:HostPrepSSHKey = $null
-    Write-Log "  Temporary SSH keypair removed." -Color DarkGray
+# Remove the throwaway SSH credential helper created for this run (if any)
+if ($script:HostPrepSSHAuth) {
+    Remove-Item -Path $script:HostPrepSSHAuth.KeyDir -Recurse -Force -ErrorAction SilentlyContinue
+    $script:HostPrepSSHAuth = $null
+    Write-Log "  Temporary SSH credential helper removed." -Color DarkGray
 }
 
 Write-Log ("=" * $summaryWidth) -Color DarkCyan
