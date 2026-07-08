@@ -19,11 +19,13 @@
          if VSAN_ESA or VVOL is intended
       6b. vSAN disk wipe (optional, -WipeDisk only)  --  enumerates non-boot
          disks with existing partitions and wipes them via partedUtil over SSH,
-         preparing disks for clean vSAN commissioning. Requires Posh-SSH.
-         Boot disk is always excluded. Skipped for VMFS_FC and NFS hosts.
+         preparing disks for clean vSAN commissioning. Requires the Windows
+         OpenSSH client (ssh.exe). Boot disk is always excluded. Skipped for
+         VMFS_FC and NFS hosts.
       7. Certificate regeneration  --  check CN vs FQDN; if mismatched, enable
-         SSH temporarily, run /sbin/generate-certificates via Posh-SSH, disable
-         SSH, reboot, and wait for the host to return online
+         SSH temporarily, run /sbin/generate-certificates via the built-in
+         OpenSSH client, disable SSH, reboot, and wait for the host to return
+         online
       8. Password reset (optional)  --  reset root password to a VCF 9 compliant
          value; always runs last so the existing credential is valid throughout
 
@@ -74,12 +76,17 @@
 
         Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
 
-    Posh-SSH is optional but required for automated certificate regeneration:
+    The Windows OpenSSH client (ssh.exe, standard on Windows 10 1809+ and
+    Windows 11) is required for automated certificate regeneration and
+    -WipeDisk. If it is missing, install the optional feature:
 
-        Install-Module -Name Posh-SSH -Scope CurrentUser
+        Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 
-    Without Posh-SSH the script will print per-host manual instructions for
-    the certificate step instead of failing.
+    SSH authentication uses a throwaway ed25519 keypair generated per run;
+    the public key is installed on each host over HTTPS (no manual key setup
+    needed) and removed again when the host's SSH steps finish. Without the
+    OpenSSH client the script will print per-host manual instructions for
+    the certificate and disk wipe steps instead of failing.
 
     VCF 9 Password Requirements
     ---------------------------
@@ -119,8 +126,8 @@
 .PARAMETER WipeDisk
     Enumerates non-boot disks with existing partitions on each VSAN host and
     wipes their partition tables via SSH using partedUtil, preparing them for
-    clean vSAN commissioning. Requires Posh-SSH. Without Posh-SSH the script
-    prints manual SSH instructions per host instead of failing.
+    clean vSAN commissioning. Requires the Windows OpenSSH client. Without it
+    the script prints manual SSH instructions per host instead of failing.
     Boot disk is always excluded unconditionally.
     Skipped for hosts detected as VMFS_FC or NFS.
 
@@ -144,10 +151,10 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 4.0.9
+    Version : 4.1.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-04-05
+    Date    : 2026-07-08
 
     Changelog:
         1.0.0 - Initial release
@@ -288,6 +295,13 @@
         4.0.9 - Removed diagnostic/debug logging from Invoke-VSANDiskWipe;
                 boot detection layers log only on success or actionable
                 warning; VMFS unmount list logged once at collection time
+        4.1.0 - Replaced Posh-SSH with the built-in Windows OpenSSH client
+                (ssh.exe): a throwaway ed25519 keypair is generated once per
+                run, the public key is installed per host via HTTPS PUT to
+                /host/ssh_root_authorized_keys and removed again after the
+                host's SSH steps, commands run via ssh.exe with a temp
+                known_hosts file, and the keypair is deleted at end of run.
+                No external module dependencies remain. (GitHub issue #3)
 #>
 
 [CmdletBinding()]
@@ -314,8 +328,8 @@ param (
     ),
 
     # Enumerate non-boot disks with existing partitions on each VSAN host and
-    # wipe them via partedUtil over SSH. Requires Posh-SSH. Boot disk is always
-    # excluded. Skipped for VMFS_FC and NFS hosts.
+    # wipe them via partedUtil over SSH. Requires the Windows OpenSSH client.
+    # Boot disk is always excluded. Skipped for VMFS_FC and NFS hosts.
     [switch]$WipeDisk
 )
 
@@ -323,10 +337,10 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "4.0.9"
+    Version = "4.1.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-04-05"
+    Date    = "2026-07-08"
 }
 
 #endregion
@@ -487,23 +501,40 @@ if ($DryRun -and $WhatIfReport) {
 
 Write-Log "HostPrep started at $(Get-Date)"
 
-# Verify optional modules (Posh-SSH needed for cert regen  --  not relevant in WhatIfReport mode)
-$script:PoshSSHAvailable = $false
+# Verify the Windows OpenSSH client is available (needed for cert regen and
+# -WipeDisk  --  not relevant in WhatIfReport mode)
+$script:SSHClientAvailable = $false
+$script:HostPrepSSHKey     = $null
 if (-not $WhatIfReport) {
-    if (-not (Get-Module -ListAvailable -Name "Posh-SSH")) {
+    if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue) -or
+        -not (Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue)) {
         Write-Log ""
-        Write-Log "  WARNING: The 'Posh-SSH' module is not installed." -Level WARN
-        Write-Log "  Certificate regeneration will be skipped for all hosts." -Level WARN
-        Write-Log "  To enable it, run: Install-Module -Name Posh-SSH -Scope CurrentUser" -Level WARN
+        Write-Log "  WARNING: The Windows OpenSSH client (ssh.exe / ssh-keygen.exe) was not found." -Level WARN
+        Write-Log "  Certificate regeneration and disk wipe will be skipped for all hosts." -Level WARN
+        Write-Log "  To enable it, install the 'OpenSSH Client' optional Windows feature:" -Level WARN
+        Write-Log "    Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0" -Level WARN
         Write-Log ""
     } else {
-        Import-Module Posh-SSH -ErrorAction Stop
-        $script:PoshSSHAvailable = $true
+        $script:SSHClientAvailable = $true
     }
 }
 
 # Required for HTML entity encoding in the commissioning report
 Add-Type -AssemblyName System.Web
+
+# Trust-all certificate callback for direct HTTPS calls to ESXi hosts (their
+# certs are self-signed at prep time). Compiled once per session; scriptblock
+# delegates are not reliable as TLS callbacks in Windows PowerShell.
+if (-not ("HostPrepTls" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System.Net.Security;
+public static class HostPrepTls
+{
+    public static readonly RemoteCertificateValidationCallback TrustAll =
+        (sender, certificate, chain, sslPolicyErrors) => true;
+}
+"@
+}
 
 #endregion
 #region --- Helper Functions ---
@@ -677,6 +708,138 @@ function Test-ESXiCertificateNeedsRegen {
     }
 }
 
+function Get-HostPrepSSHKey {
+    <#
+    .SYNOPSIS
+        Returns this run's throwaway SSH keypair, generating it on first use.
+
+    .DESCRIPTION
+        Generates a passphrase-less ed25519 keypair with ssh-keygen in a
+        run-specific temp folder and caches it in script scope. The same
+        keypair is reused for every host in the run; the public key is only
+        present on a host for the duration of its SSH operations and is
+        removed again afterwards. A temp known_hosts file lives alongside the
+        key so host keys never pollute the user's ~/.ssh/known_hosts.
+        The temp folder is deleted at the end of the run.
+
+    .OUTPUTS
+        PSCustomObject with:
+          .KeyDir         [string] - temp folder holding all key material
+          .PrivateKeyPath [string] - path to the private key for ssh -i
+          .PublicKey      [string] - public key line for authorized_keys
+          .KnownHostsPath [string] - temp known_hosts file for this run
+    #>
+    if ($script:HostPrepSSHKey) { return $script:HostPrepSSHKey }
+
+    $keyDir = Join-Path ([System.IO.Path]::GetTempPath()) ("HostPrep_ssh_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
+    $privateKeyPath = Join-Path $keyDir "id_ed25519"
+
+    # PowerShell 7.3+ passes empty-string arguments to native commands
+    # correctly; older versions drop them, so the empty passphrase must be
+    # smuggled through as a literal '""'.
+    $emptyPassphrase = if ($PSVersionTable.PSVersion -ge [version]'7.3') { "" } else { '""' }
+    & ssh-keygen -q -t ed25519 -C "HostPrep.ps1 temporary key" -f $privateKeyPath -N $emptyPassphrase 2>&1 | Out-Null
+
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$privateKeyPath.pub")) {
+        Remove-Item -Path $keyDir -Recurse -Force -ErrorAction SilentlyContinue
+        throw "ssh-keygen failed to generate a temporary keypair (exit code $LASTEXITCODE)."
+    }
+
+    $script:HostPrepSSHKey = [PSCustomObject]@{
+        KeyDir         = $keyDir
+        PrivateKeyPath = $privateKeyPath
+        PublicKey      = (Get-Content "$privateKeyPath.pub" -Raw).Trim()
+        KnownHostsPath = (Join-Path $keyDir "known_hosts")
+    }
+    Write-Log "  Generated temporary SSH keypair for this run." -Color DarkGray
+    return $script:HostPrepSSHKey
+}
+
+function Set-ESXiRootAuthorizedKeys {
+    <#
+    .SYNOPSIS
+        Writes (or clears) root's authorized_keys on an ESXi host via HTTPS.
+
+    .DESCRIPTION
+        ESXi exposes root's authorized_keys file as an HTTPS endpoint
+        (/host/ssh_root_authorized_keys) that accepts PUT with the root
+        credentials, which makes it possible to install an SSH public key
+        before any SSH session exists. Putting an empty body clears the file
+        again. The host's self-signed certificate is accepted for this
+        request only.
+
+    .PARAMETER VMHost
+        FQDN of the ESXi host.
+
+    .PARAMETER Credential
+        PSCredential for the root account.
+
+    .PARAMETER Content
+        The authorized_keys content to write. An empty string (default)
+        clears the file.
+    #>
+    param (
+        [Parameter(Mandatory)][string]$VMHost,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential,
+        [AllowEmptyString()][string]$Content = ""
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create("https://$VMHost/host/ssh_root_authorized_keys")
+    $request.Method      = "PUT"
+    $request.ContentType = "text/plain"
+    $request.Timeout     = 30000
+    $request.ServerCertificateValidationCallback = [HostPrepTls]::TrustAll
+
+    $authPair = "{0}:{1}" -f $Credential.UserName, $Credential.GetNetworkCredential().Password
+    $request.Headers["Authorization"] = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($authPair))
+
+    $body = [Text.Encoding]::ASCII.GetBytes($Content)
+    $request.ContentLength = $body.Length
+    $requestStream = $request.GetRequestStream()
+    try {
+        $requestStream.Write($body, 0, $body.Length)
+    } finally {
+        $requestStream.Close()
+    }
+    $request.GetResponse().Close()
+}
+
+function Invoke-ESXiSSHCommand {
+    <#
+    .SYNOPSIS
+        Runs a single command on an ESXi host using the built-in OpenSSH
+        client (ssh.exe) with this run's temporary keypair.
+
+    .OUTPUTS
+        PSCustomObject with:
+          .ExitStatus [int]      - remote command exit code (255 = connection
+                                   or authentication failure)
+          .Output     [string[]] - stdout and stderr merged
+    #>
+    param (
+        [Parameter(Mandatory)][string]$VMHost,
+        [Parameter(Mandatory)][string]$Command
+    )
+
+    $sshKey  = Get-HostPrepSSHKey
+    $sshArgs = @(
+        "-i", $sshKey.PrivateKeyPath
+        "-o", "BatchMode=yes"                       # never fall back to interactive password prompts
+        "-o", "StrictHostKeyChecking=accept-new"    # auto-accept unknown host keys
+        "-o", ("UserKnownHostsFile=`"{0}`"" -f $sshKey.KnownHostsPath)
+        "-o", "ConnectTimeout=20"
+        "root@$VMHost"
+        $Command
+    )
+    $output = & ssh.exe @sshArgs 2>&1 | ForEach-Object { "$_" }
+
+    return [PSCustomObject]@{
+        ExitStatus = $LASTEXITCODE
+        Output     = @($output)
+    }
+}
+
 function Invoke-ESXiCertificateRegen {
     <#
     .SYNOPSIS
@@ -684,9 +847,9 @@ function Invoke-ESXiCertificateRegen {
 
     .DESCRIPTION
         - Enables SSH on the host via PowerCLI (Set-VMHostServiceConfig)
-        - Opens an SSH session using Posh-SSH with the supplied root credentials
-        - Runs /sbin/generate-certificates
-        - Disables SSH again regardless of outcome (try/finally)
+        - Installs this run's temporary SSH public key via HTTPS
+        - Runs /sbin/generate-certificates using the built-in OpenSSH client
+        - Removes the key and disables SSH again regardless of outcome
         - Returns $true on success, throws on failure
 
     .PARAMETER VMHost
@@ -708,15 +871,15 @@ function Invoke-ESXiCertificateRegen {
     Write-Log "  Enabling SSH temporarily for certificate regeneration..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
 
-    $sshSession = $null
+    $keyInstalled = $false
     try {
-        # Connect via SSH
-        Write-Log "  Connecting via SSH to run /sbin/generate-certificates..."
-        $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential `
-                        -AcceptKey -ErrorAction Stop
+        # Install the temporary public key over HTTPS, then run the command
+        Write-Log "  Installing temporary SSH public key via HTTPS..."
+        Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content (Get-HostPrepSSHKey).PublicKey
+        $keyInstalled = $true
 
-        $sshResult = Invoke-SSHCommand -SessionId $sshSession.SessionId `
-                        -Command "/sbin/generate-certificates" -ErrorAction Stop
+        Write-Log "  Connecting via SSH to run /sbin/generate-certificates..."
+        $sshResult = Invoke-ESXiSSHCommand -VMHost $VMHost -Command "/sbin/generate-certificates"
 
         if ($sshResult.ExitStatus -ne 0) {
             throw "/sbin/generate-certificates exited with code $($sshResult.ExitStatus). Output: $($sshResult.Output -join ' ')"
@@ -726,9 +889,14 @@ function Invoke-ESXiCertificateRegen {
         return $true
 
     } finally {
-        # Always close SSH session and disable the service
-        if ($sshSession) {
-            Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null
+        # Always remove the temporary key and disable the service
+        if ($keyInstalled) {
+            try {
+                Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content ""
+                Write-Log "  Temporary SSH public key removed from $VMHost." -Color DarkGray
+            } catch {
+                Write-Log "  Could not remove temporary SSH key from ${VMHost}: $_" -Level WARN
+            }
         }
         Write-Log "  Disabling SSH..." -Level WARN
         $svc = Get-VMHostService -VMHost $VMHostObj | Where-Object { $_.Key -eq "TSM-SSH" }
@@ -1042,7 +1210,7 @@ function Invoke-VSANDiskWipe {
         - Unmounts any VMFS datastores on target disks via SSH (esxcli storage vmfs unmount)
           before wiping -- no vCenter connection required
         - Wipes partition tables via SSH using: partedUtil mklabel <device> gpt
-        - Falls back to printing manual SSH instructions if Posh-SSH is unavailable
+        - Falls back to printing manual SSH instructions if the OpenSSH client is unavailable
 
     .PARAMETER VMHost
         FQDN of the ESXi host (string, used for SSH connection).
@@ -1209,10 +1377,10 @@ function Invoke-VSANDiskWipe {
         return [PSCustomObject]@{ Status = "Skipped (operator)"; WipedCount = 0; FailedDisks = @() }
     }
 
-    # --- Posh-SSH availability check (soft fail) ---
-    if (-not $script:PoshSSHAvailable) {
+    # --- OpenSSH client availability check (soft fail) ---
+    if (-not $script:SSHClientAvailable) {
         Write-Log ""
-        Write-Log "  Posh-SSH not available. Cannot run partedUtil via SSH." -Level WARN
+        Write-Log "  OpenSSH client not available. Cannot run partedUtil via SSH." -Level WARN
         Write-Log ("  ACTION REQUIRED: Manually wipe the following disks on {0} via SSH:" -f $VMHost) -Level WARN
         foreach ($disk in $disksToWipe) {
             Write-Log ("    partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device) -Color Cyan
@@ -1240,23 +1408,30 @@ function Invoke-VSANDiskWipe {
         Write-Log ("  VMFS extent check failed (non-fatal): {0}" -f $_) -Level WARN
     }
 
-    # --- Enable SSH temporarily, then unmount VMFS and wipe in one session ---
+    # --- Enable SSH temporarily, install temp key, then unmount VMFS and wipe ---
     Write-Log "  Enabling SSH temporarily for disk wipe..." -Level WARN
     Set-VMHostServiceConfig -VMHost $VMHostObj -ServiceKey "TSM-SSH"
 
     $wipedCount = 0
     $failedDisks = [System.Collections.Generic.List[string]]::new()
-    $sshSession  = $null
+    $keyInstalled = $false
 
     try {
+        Write-Log "  Installing temporary SSH public key via HTTPS..." -Color Cyan
+        Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content (Get-HostPrepSSHKey).PublicKey
+        $keyInstalled = $true
+
         Write-Log "  Connecting via SSH to run partedUtil..." -Color Cyan
-        $sshSession = New-SSHSession -ComputerName $VMHost -Credential $Credential -AcceptKey -ErrorAction Stop
+        $probe = Invoke-ESXiSSHCommand -VMHost $VMHost -Command "echo connected"
+        if ($probe.ExitStatus -ne 0) {
+            throw ("SSH connection failed: {0}" -f (($probe.Output -join ' ').Trim()))
+        }
 
         # Layer 4: /proc/mounts bootbank check -- definitive boot device identification via SSH.
-        # Runs after session is open; retroactively removes boot disk from wipe list if it was
-        # missed by Layers 1-3 (e.g. nested ESXi where IsBootDrive flag is not set).
-        $mountResult = Invoke-SSHCommand -SessionId $sshSession.SessionId `
-            -Command "grep ' /bootbank ' /proc/mounts" -ErrorAction SilentlyContinue
+        # Runs after connectivity is verified; retroactively removes boot disk from wipe list if
+        # it was missed by Layers 1-3 (e.g. nested ESXi where IsBootDrive flag is not set).
+        $mountResult = Invoke-ESXiSSHCommand -VMHost $VMHost `
+            -Command "grep ' /bootbank ' /proc/mounts"
         $bootMountRaw = ($mountResult.Output | Where-Object { $_ -match '/dev/disks/' } | Select-Object -First 1)
         if ($bootMountRaw) {
             $bootMountRaw = ($bootMountRaw.Trim() -split '\s+')[0]   # first field = device path
@@ -1276,9 +1451,8 @@ function Invoke-VSANDiskWipe {
         # Unmount VMFS volumes via SSH before wiping
         foreach ($volName in $vmfsToUnmount) {
             Write-Log ("  Unmounting VMFS datastore '{0}'..." -f $volName) -Level WARN
-            $umResult = Invoke-SSHCommand -SessionId $sshSession.SessionId `
-                -Command ("esxcli storage filesystem unmount -l '{0}'" -f $volName) `
-                -ErrorAction SilentlyContinue
+            $umResult = Invoke-ESXiSSHCommand -VMHost $VMHost `
+                -Command ("esxcli storage filesystem unmount -l '{0}'" -f $volName)
             if ($umResult.ExitStatus -eq 0) {
                 Write-Log ("  Datastore '{0}' unmounted." -f $volName) -Color Green
             } else {
@@ -1291,7 +1465,7 @@ function Invoke-VSANDiskWipe {
             try {
                 Write-Log ("  Wiping {0} ({1} GB)..." -f $disk.Device, $disk.SizeGB) -Level WARN
                 $cmd    = "partedUtil mklabel /vmfs/devices/disks/{0} gpt" -f $disk.Device
-                $result = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $cmd -ErrorAction Stop
+                $result = Invoke-ESXiSSHCommand -VMHost $VMHost -Command $cmd
 
                 if ($result.ExitStatus -eq 0) {
                     Write-Log ("  Wiped {0} successfully." -f $disk.Device) -Color Green
@@ -1308,15 +1482,20 @@ function Invoke-VSANDiskWipe {
         }
 
     } catch {
-        Write-Log ("  SSH connection failed: {0}" -f $_) -Level WARN
+        Write-Log ("  SSH setup failed: {0}" -f $_) -Level WARN
         return [PSCustomObject]@{
             Status      = "FAILED: SSH - $_"
             WipedCount  = 0
             FailedDisks = @($disksToWipe | Select-Object -ExpandProperty Device)
         }
     } finally {
-        if ($sshSession) {
-            Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null
+        if ($keyInstalled) {
+            try {
+                Set-ESXiRootAuthorizedKeys -VMHost $VMHost -Credential $Credential -Content ""
+                Write-Log "  Temporary SSH public key removed from $VMHost." -Color DarkGray
+            } catch {
+                Write-Log "  Could not remove temporary SSH key from ${VMHost}: $_" -Level WARN
+            }
         }
         Write-Log "  Disabling SSH..." -Level WARN
         $svc = Get-VMHostService -VMHost $VMHostObj | Where-Object { $_.Key -eq "TSM-SSH" }
@@ -1945,7 +2124,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 $hostResult.CertRegen = "OK"
                 $hostResult.Rebooted  = "OK"
             } else {
-                # Always read cert thumbprint and expiry -- no Posh-SSH required
+                # Always read cert thumbprint and expiry -- no SSH required
                 $certCheck = Test-ESXiCertificateNeedsRegen -VMHost $esxiHost
                 $hostResult.Thumbprint = $certCheck.Thumbprint
                 $hostResult.Expiry     = $certCheck.Expiry
@@ -1953,8 +2132,8 @@ foreach ($esxiHost in $targetEsxiHosts) {
                 if (-not $certCheck.NeedsRegen) {
                     $hostResult.CertRegen = "Skipped"
                     $hostResult.Rebooted  = "Skipped"
-                } elseif (-not $script:PoshSSHAvailable) {
-                    Write-Log "  Posh-SSH not available. Certificate regeneration skipped." -Level WARN
+                } elseif (-not $script:SSHClientAvailable) {
+                    Write-Log "  OpenSSH client not available. Certificate regeneration skipped." -Level WARN
                     Write-Log "  ACTION REQUIRED: Manually run on this host and then reboot:" -Level WARN
                     Write-Log "    /sbin/generate-certificates"
                     $hostResult.CertRegen = "Manual"
@@ -2125,6 +2304,13 @@ if ($csvRows) {
     Write-Log ("  {0} host(s) exported to CSV." -f @($csvRows).Count) -Color DarkGray
 } else {
     Write-Log "  No hosts with valid thumbprints  --  CSV not written." -Level WARN
+}
+
+# Remove the throwaway SSH keypair generated for this run (if any)
+if ($script:HostPrepSSHKey) {
+    Remove-Item -Path $script:HostPrepSSHKey.KeyDir -Recurse -Force -ErrorAction SilentlyContinue
+    $script:HostPrepSSHKey = $null
+    Write-Log "  Temporary SSH keypair removed." -Color DarkGray
 }
 
 Write-Log ("=" * $summaryWidth) -Color DarkCyan

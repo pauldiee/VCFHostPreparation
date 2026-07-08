@@ -26,7 +26,7 @@ Reads a plain text file with one ESXi FQDN per line and runs the following steps
 5. **Optional Advanced Settings** — applies any extra settings enabled in the `$OptionalAdvancedSettings` block
 6. **Storage type detection** — detects the primary storage type for the commissioning CSV (see below)
 6b. **vSAN disk wipe** *(optional, `-WipeDisk` only)* — enumerates non-boot disks with existing partitions and wipes them via `partedUtil` over SSH, preparing disks for clean vSAN commissioning (see below)
-7. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not: temporarily enables SSH, runs `/sbin/generate-certificates` via Posh-SSH, disables SSH, reboots, waits for the host to return online
+7. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not: temporarily enables SSH, runs `/sbin/generate-certificates` via the built-in Windows OpenSSH client, disables SSH, reboots, waits for the host to return online
 8. **Password reset** *(optional)* — resets the root password to a VCF 9 compliant value; always runs last so the existing credential stays valid throughout
 
 After all hosts are processed:
@@ -50,7 +50,7 @@ Use `-WipeDisk` to clean disks on hosts that were previously part of a vSAN clus
 
 **Only runs for hosts detected as `VSAN`.** Skipped automatically for `VMFS_FC` and `NFS` hosts.
 
-Requires Posh-SSH. Without it the script prints per-host manual SSH instructions instead of failing.
+Requires the Windows OpenSSH client (`ssh.exe`). Without it the script prints per-host manual SSH instructions instead of failing.
 
 ```powershell
 # Wipe vSAN disks during host prep
@@ -80,7 +80,7 @@ After connecting to each host, `HostPrep.ps1` detects the storage type and write
 |---|---|
 | PowerShell 5.1 | Included with Windows 10 / Server 2016 and later |
 | VMware PowerCLI | `Install-Module -Name VMware.PowerCLI -Scope CurrentUser` |
-| Posh-SSH | Optional — required for automated cert regen and `-WipeDisk`. `Install-Module -Name Posh-SSH -Scope CurrentUser` |
+| OpenSSH Client | Standard on Windows 10 1809+ / Windows 11 — required for automated cert regen and `-WipeDisk`. If missing: `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` |
 
 One-time PowerCLI setup (run once per user account):
 
@@ -88,7 +88,7 @@ One-time PowerCLI setup (run once per user account):
 Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
 ```
 
-Without Posh-SSH the script prints per-host manual instructions for the certificate and disk wipe steps.
+SSH authentication uses a throwaway ed25519 keypair generated per run; the public key is installed on each host over HTTPS (`/host/ssh_root_authorized_keys`) and removed again when the host's SSH steps finish — no manual key setup or extra modules needed. Without the OpenSSH client the script prints per-host manual instructions for the certificate and disk wipe steps.
 
 ### Usage
 
