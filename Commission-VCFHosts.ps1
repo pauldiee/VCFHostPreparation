@@ -115,10 +115,10 @@
 
 .NOTES
     Script  : Commission-VCFHosts.ps1
-    Version : 3.1.3
+    Version : 3.1.4
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-04-02
+    Date    : 2026-04-07
 
     Changelog:
         1.0.0 - Initial release. Reads HostPrep CSV, authenticates to SDDC Manager,
