@@ -335,6 +335,11 @@
                 not supplied, instead of silently applying the pool.ntp.org
                 parameter default to every host. Passing -NtpServers still runs
                 unattended. (GitHub issue #6)
+              - Added a PowerCLI preflight check: if VMware.VimAutomation.Core
+                is not installed the script now exits immediately with the
+                install command, instead of erroring on every PowerCLI cmdlet
+                and still prompting for the host list, NTP servers and root
+                password before failing at Connect-VIServer.
 #>
 
 [CmdletBinding()]
@@ -481,6 +486,29 @@ function Write-Log {
 #endregion
 
 #region --- Initialisation ---
+
+# PowerCLI is a hard dependency  --  every host operation runs through it. Check
+# for it before anything else: without this the missing cmdlets surface as a wall
+# of "not recognized" errors and the script carries on to prompt for the host
+# list, NTP servers and the root password before finally dying at Connect-VIServer.
+#
+# Deliberately uses Write-Host rather than Write-Log: the log file is created
+# further down, and this check must run before the Get-PowerCLIConfiguration
+# calls immediately below.
+if (-not (Get-Module -ListAvailable -Name VMware.VimAutomation.Core)) {
+    Write-Host ""
+    Write-Host "  ERROR: VMware PowerCLI was not found." -ForegroundColor Red
+    Write-Host "  HostPrep needs it to connect to the ESXi hosts and cannot continue." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Install it for the current user (no admin rights required):" -ForegroundColor Yellow
+    Write-Host "    Install-Module -Name VMware.PowerCLI -Scope CurrentUser" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host ("  This session is PowerShell {0} ({1}). PowerCLI must be installed for the" -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition) -ForegroundColor DarkGray
+    Write-Host "  same edition you run HostPrep with  --  a copy installed under Windows" -ForegroundColor DarkGray
+    Write-Host "  PowerShell 5.1 is not visible to PowerShell 7, and vice versa." -ForegroundColor DarkGray
+    Write-Host ""
+    exit 1
+}
 
 # Suppress PowerCLI CEIP nag. The warning fires on first module load in any
 # new session, so we persist the opt-out to the User scope once and silently

@@ -79,7 +79,7 @@ After connecting to each host, `HostPrep.ps1` detects the storage type and write
 | Requirement | Notes |
 |---|---|
 | PowerShell 5.1 | Included with Windows 10 / Server 2016 and later |
-| VMware PowerCLI | `Install-Module -Name VMware.PowerCLI -Scope CurrentUser` |
+| VMware PowerCLI | `Install-Module -Name VMware.PowerCLI -Scope CurrentUser`. Install it for the **same PowerShell edition you run HostPrep with** — a copy under Windows PowerShell 5.1 is not visible to PowerShell 7, and vice versa. The script checks for PowerCLI at startup and exits with the install command if it is missing |
 | OpenSSH Client | Standard on Windows 10 1809+ / Windows 11 — required for automated cert regen and `-WipeDisk`. If missing: `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` |
 
 One-time PowerCLI setup (run once per user account):
