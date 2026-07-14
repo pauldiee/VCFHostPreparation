@@ -88,7 +88,7 @@ One-time PowerCLI setup (run once per user account):
 Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
 ```
 
-SSH authentication uses a throwaway ed25519 keypair generated per run; the public key is installed on each host over HTTPS (`/host/ssh_root_authorized_keys`) and removed again when the host's SSH steps finish — no manual key setup or extra modules needed. Without the OpenSSH client the script prints per-host manual instructions for the certificate and disk wipe steps.
+SSH authenticates with the **root password** via `ssh.exe`'s `SSH_ASKPASS` helper — no key setup, no manual steps, no extra modules. (Earlier versions installed a throwaway ed25519 public key over HTTPS; ESXi 9 removed the `/host/ssh_root_authorized_keys` endpoint that relied on, so password auth over the built-in client is used instead — see issue #3.) Without the OpenSSH client the script prints per-host manual instructions for the certificate and disk wipe steps.
 
 ### Usage
 
