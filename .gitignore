@@ -9,6 +9,10 @@ Commission_*.csv
 Commission_*.html
 Commission_*.json
 
+# Local optional advanced settings -- the .example templates stay tracked
+HostPrep.Settings.json
+HostPrep.Settings.psd1
+
 # Host list files
 testhost.txt
 host.txt
