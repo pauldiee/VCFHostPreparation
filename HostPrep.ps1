@@ -25,7 +25,10 @@
       7. Certificate regeneration  --  check CN vs FQDN; if mismatched, enable
          SSH temporarily, run /sbin/generate-certificates via the built-in
          OpenSSH client, disable SSH, reboot, and wait for the host to return
-         online
+         online. If the host's own configured hostname disagrees with the host
+         list, offer to correct it first (Y/N per host)  --  generate-certificates
+         derives the CN from that hostname, so regenerating without fixing it
+         would reproduce the same wrong CN
       8. Password reset (optional)  --  reset root password to a VCF 9 compliant
          value; always runs last so the existing credential is valid throughout
 
@@ -167,7 +170,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 4.3.0
+    Version : 4.4.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-14
@@ -340,6 +343,13 @@
                 install command, instead of erroring on every PowerCLI cmdlet
                 and still prompting for the host list, NTP servers and root
                 password before failing at Connect-VIServer.
+        4.4.0 - Certificate regeneration no longer just skips a host whose
+                configured hostname disagrees with the host list: added
+                Repair-ESXiHostname, which prompts Y/N and sets the ESXi
+                hostname/domain from the host list via Set-VMHostNetwork,
+                verifies the change, then continues into regeneration. The regen
+                reboot covers the rename too. Declining keeps the old behaviour
+                (skip, flag CN mismatch). (GitHub issue #8)
 #>
 
 [CmdletBinding()]
@@ -375,7 +385,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "4.3.0"
+    Version = "4.4.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-14"
@@ -1230,6 +1240,87 @@ function Get-ESXiStorageType {
     } catch {
         Write-Log "  Storage type detection failed: $_ -- defaulting to VSAN" -Level WARN
         return "VSAN"
+    }
+}
+
+function Repair-ESXiHostname {
+    <#
+    .SYNOPSIS
+        Offers to correct the ESXi host's configured hostname and domain so a
+        regenerated certificate will carry the right CN.
+
+    .DESCRIPTION
+        /sbin/generate-certificates builds the certificate CN from the host's own
+        configured FQDN. Regenerating while that hostname is wrong just reproduces
+        the wrong CN and wastes a reboot, so the caller checks first and calls this
+        when the host disagrees with the host list.
+
+        Prompts Y/N, then sets the hostname and domain from the FQDN in the host
+        list via Set-VMHostNetwork and re-reads them from the host to confirm the
+        change took. Renaming a host is never silent.
+
+        The caller regenerates the certificate and reboots immediately after, so
+        the rename needs no reboot of its own.
+
+    .PARAMETER VMHost
+        Expected FQDN of the ESXi host, as listed in the host list file.
+
+    .PARAMETER VMHostObj
+        Connected VMHost object, used to re-read the network config afterwards.
+
+    .PARAMETER HostNetwork
+        VMHostNetworkInfo for the host (from Get-VMHostNetwork). Set-VMHostNetwork
+        takes this object rather than a VMHost.
+
+    .OUTPUTS
+        [bool] $true if the host's FQDN now matches $VMHost and regeneration
+        should proceed; $false if declined, not applicable, or the change failed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$VMHost,
+        [Parameter(Mandatory)]$VMHostObj,
+        [Parameter(Mandatory)]$HostNetwork
+    )
+
+    # A short name in the host list gives no domain to configure, so there is
+    # nothing sensible to set here.
+    if ($VMHost -notmatch '\.') {
+        Write-Log "  '$VMHost' is not an FQDN, so no domain can be derived. Hostname fix skipped." -Level WARN
+        return $false
+    }
+
+    $desiredShort  = $VMHost.Split('.')[0]
+    $desiredDomain = ($VMHost -split '\.', 2)[1]
+
+    $answer = (Read-Host "  Fix the hostname on $VMHost so the certificate CN will match? [Y/N]").Trim().ToUpper()
+    if ($answer -ne 'Y') {
+        Write-Log "  Hostname fix declined." -Level WARN
+        return $false
+    }
+
+    try {
+        Write-Log "    Setting hostname : $desiredShort" -Color DarkGray
+        Write-Log "    Setting domain   : $desiredDomain" -Color DarkGray
+
+        Set-VMHostNetwork -Network $HostNetwork -HostName $desiredShort -DomainName $desiredDomain `
+            -Confirm:$false -ErrorAction Stop | Out-Null
+
+        # Read it back from the host rather than trusting the call to have stuck:
+        # a wrong CN is exactly the failure this is meant to prevent.
+        $updated     = Get-VMHostNetwork -VMHost $VMHostObj
+        $updatedFqdn = "$($updated.HostName).$($updated.DomainName)".ToLower().TrimEnd('.')
+
+        if ($updatedFqdn -eq $VMHost.ToLower()) {
+            Write-Log "  Hostname updated to '$updatedFqdn'. Proceeding with certificate regeneration." -Color Green
+            return $true
+        }
+
+        Write-Log "  Hostname still reads '$updatedFqdn' after the change. Regeneration skipped." -Level WARN
+        return $false
+
+    } catch {
+        Write-Log "  Failed to set the hostname: $_" -Level WARN
+        return $false
     }
 }
 
@@ -2264,6 +2355,7 @@ foreach ($esxiHost in $targetEsxiHosts) {
         try {
             if ($DryRun) {
                 Write-Log "  [DRY RUN] Would check if certificate CN matches hostname." -Color DarkYellow
+                Write-Log "  [DRY RUN] On a hostname mismatch, would offer to set the ESXi hostname/domain to '$esxiHost'." -Color DarkYellow
                 Write-Log "  [DRY RUN] Would regenerate host certificate if needed." -Color DarkYellow
                 Write-Log "  [DRY RUN] Would reboot host and wait for it to come back online." -Color DarkYellow
                 $hostResult.CertRegen = "OK"
@@ -2288,10 +2380,22 @@ foreach ($esxiHost in $targetEsxiHosts) {
                     # hosts file before attempting regen -- generate-certificates uses
                     # the host's own configured FQDN, so a hostname mismatch means
                     # regen would produce the same wrong CN and the reboot is wasted.
-                    $hostNet  = Get-VMHostNetwork -VMHost $vmHostObj
-                    $esxiFqdn = "$($hostNet.HostName).$($hostNet.DomainName)".ToLower().TrimEnd('.')
-                    if ($esxiFqdn -ne $esxiHost.ToLower()) {
+                    $hostNet    = Get-VMHostNetwork -VMHost $vmHostObj
+                    $esxiFqdn   = "$($hostNet.HostName).$($hostNet.DomainName)".ToLower().TrimEnd('.')
+                    $hostnameOk = ($esxiFqdn -eq $esxiHost.ToLower())
+
+                    # Mismatch is fixable from here: offer to set the hostname from the
+                    # host list, then regenerate. The regen reboots the host anyway, so
+                    # the rename costs nothing extra.
+                    if (-not $hostnameOk) {
                         Write-Log "  ESXi hostname '$esxiFqdn' does not match expected FQDN '$esxiHost'." -Level WARN
+                        $hostnameOk = Repair-ESXiHostname `
+                            -VMHost      $esxiHost `
+                            -VMHostObj   $vmHostObj `
+                            -HostNetwork $hostNet
+                    }
+
+                    if (-not $hostnameOk) {
                         Write-Log "  Certificate regeneration skipped: fix the ESXi hostname first or" -Level WARN
                         Write-Log "  the regenerated certificate will still have the wrong CN." -Level WARN
                         $hostResult.CertRegen = "CN mismatch"

@@ -4,7 +4,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 
 | Script | Version | Purpose |
 |---|---|---|
-| `HostPrep.ps1` | 4.3.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
+| `HostPrep.ps1` | 4.4.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
 | `Commission-VCFHosts.ps1` | 3.1.4 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
@@ -26,7 +26,7 @@ Reads a plain text file with one ESXi FQDN per line and runs the following steps
 5. **Optional Advanced Settings** — applies any extra settings that are enabled, either in the script's built-in block or in an external settings file (see below)
 6. **Storage type detection** — detects the primary storage type for the commissioning CSV (see below)
 6b. **vSAN disk wipe** *(optional, `-WipeDisk` only)* — enumerates non-boot disks with existing partitions and wipes them via `partedUtil` over SSH, preparing disks for clean vSAN commissioning (see below)
-7. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not: temporarily enables SSH, runs `/sbin/generate-certificates` via the built-in Windows OpenSSH client, disables SSH, reboots, waits for the host to return online
+7. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not: temporarily enables SSH, runs `/sbin/generate-certificates` via the built-in Windows OpenSSH client, disables SSH, reboots, waits for the host to return online. If the host's own configured hostname disagrees with the host list (a fresh host still calling itself `localhost.localdomain`, say), the script offers to correct it first — see below
 8. **Password reset** *(optional)* — resets the root password to a VCF 9 compliant value; always runs last so the existing credential stays valid throughout
 
 After all hosts are processed:
@@ -61,6 +61,22 @@ Requires the Windows OpenSSH client (`ssh.exe`). Without it the script prints pe
 ```
 
 > **Boot disk is always protected.** It is excluded at enumeration time and never reaches `partedUtil` regardless of the Y/N answer.
+
+### ESXi hostname mismatch
+
+`/sbin/generate-certificates` builds the certificate CN from the host's **own configured hostname**, not from whatever you put in the host list. So a freshly imaged host that still calls itself `localhost.localdomain` will keep minting `localhost.localdomain` certificates no matter how many times you regenerate — and each attempt costs a reboot.
+
+When the configured hostname disagrees with the host list, HostPrep offers to fix it:
+
+```
+  ESXi hostname 'localhost.localdomain' does not match expected FQDN 'esxi01.vcf.lab'.
+  Fix the hostname on esxi01.vcf.lab so the certificate CN will match? [Y/N]: y
+    Setting hostname : esxi01
+    Setting domain   : vcf.lab
+  Hostname updated to 'esxi01.vcf.lab'. Proceeding with certificate regeneration.
+```
+
+**Y** sets the hostname and domain from the host list (`Set-VMHostNetwork`), reads them back to confirm, then continues into certificate regeneration — which reboots the host anyway, so the rename costs no extra reboot. **N** keeps the old behaviour: regeneration is skipped and the host is flagged `CN mismatch` in the report. Hosts are never renamed silently.
 
 ### Storage type detection
 
