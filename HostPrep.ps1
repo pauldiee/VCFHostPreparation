@@ -349,7 +349,10 @@
                 hostname/domain from the host list via Set-VMHostNetwork,
                 verifies the change, then continues into regeneration. The regen
                 reboot covers the rename too. Declining keeps the old behaviour
-                (skip, flag CN mismatch). (GitHub issue #8)
+                (skip, flag CN mismatch). Hosts taking DNS from DHCP are
+                detected up front: ESXi ignores a hostname set while DHCP is in
+                charge, so the script explains that and points at the static-DNS
+                setting instead of silently failing. (GitHub issue #8)
 #>
 
 [CmdletBinding()]
@@ -1286,6 +1289,19 @@ function Repair-ESXiHostname {
     # nothing sensible to set here.
     if ($VMHost -notmatch '\.') {
         Write-Log "  '$VMHost' is not an FQDN, so no domain can be derived. Hostname fix skipped." -Level WARN
+        return $false
+    }
+
+    # When the host takes its DNS settings from DHCP, it also takes its hostname and
+    # domain from there. Set-VMHostNetwork then accepts -HostName/-DomainName without
+    # error and silently changes nothing, so catch it here rather than letting the
+    # read-back below report a baffling "hostname unchanged".
+    if ($HostNetwork.DnsFromDhcp) {
+        Write-Log "  This host obtains its DNS settings (and therefore its hostname and domain) from DHCP." -Level WARN
+        Write-Log "  ESXi ignores a hostname set while DHCP is in charge, so the fix cannot be applied." -Level WARN
+        Write-Log "  Set DNS to static on the host, then re-run  --  in the ESXi UI:" -Level WARN
+        Write-Log "    Networking > TCP/IP stacks > Default > Edit settings > 'Enter settings manually'" -Level WARN
+        Write-Log "  A VCF host should not depend on DHCP for its identity in any case." -Level WARN
         return $false
     }
 

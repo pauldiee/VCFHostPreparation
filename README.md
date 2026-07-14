@@ -78,6 +78,8 @@ When the configured hostname disagrees with the host list, HostPrep offers to fi
 
 **Y** sets the hostname and domain from the host list (`Set-VMHostNetwork`), reads them back to confirm, then continues into certificate regeneration — which reboots the host anyway, so the rename costs no extra reboot. **N** keeps the old behaviour: regeneration is skipped and the host is flagged `CN mismatch` in the report. Hosts are never renamed silently.
 
+> **Hosts on DHCP cannot be fixed this way.** If the host obtains its DNS settings from DHCP, it takes its hostname and domain from there too — ESXi accepts a hostname set via `Set-VMHostNetwork` and silently ignores it. The script detects this and tells you to switch the host to static DNS first (**Networking > TCP/IP stacks > Default > Edit settings > Enter settings manually**). A VCF host should not depend on DHCP for its identity in any case.
+
 ### Storage type detection
 
 After connecting to each host, `HostPrep.ps1` detects the storage type and writes it to the commissioning CSV:
