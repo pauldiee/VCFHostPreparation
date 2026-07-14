@@ -114,7 +114,10 @@
       - At least 3 of the 4 character classes must be present
 
 .PARAMETER NtpServers
-    One or more NTP server addresses. Defaults to 'pool.ntp.org'.
+    One or more NTP server addresses. If omitted, the script prompts for the
+    server(s) before any host is touched, offering 'pool.ntp.org' as the
+    default that Enter accepts. Supply this parameter to run unattended
+    without the prompt.
 
 .PARAMETER LogPath
     Path to write the log file. Defaults to the script directory.
@@ -164,7 +167,7 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 4.2.0
+    Version : 4.3.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-14
@@ -328,6 +331,10 @@
                 built-in $DefaultOptionalAdvancedSettings if neither file is
                 present or parsing fails; added matching .example template
                 files
+        4.3.0 - NTP servers are now confirmed interactively when -NtpServers is
+                not supplied, instead of silently applying the pool.ntp.org
+                parameter default to every host. Passing -NtpServers still runs
+                unattended. (GitHub issue #6)
 #>
 
 [CmdletBinding()]
@@ -363,7 +370,7 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "4.2.0"
+    Version = "4.3.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-14"
@@ -1916,6 +1923,35 @@ if (-not $targetEsxiHosts) {
 }
 
 Write-Log "  Loaded $($targetEsxiHosts.Count) host(s) from: $hostFilePath"
+
+#endregion
+#region --- NTP Server Selection ---
+
+# When -NtpServers is supplied on the command line the script stays unattended.
+# When it is not, confirm the servers interactively instead of silently applying
+# the public pool: on an isolated management network pool.ntp.org is unreachable,
+# which leaves every host with a dead time source and breaks commissioning later.
+if (-not $PSBoundParameters.ContainsKey('NtpServers')) {
+
+    Write-Log "`nNTP servers..."
+    Write-Log "  Default if you press Enter: $($NtpServers -join ', ')" -Color DarkGray
+
+    $ntpRaw = (Read-Host "  Enter NTP server(s), comma separated [Enter = default]").Trim()
+
+    if (-not [string]::IsNullOrWhiteSpace($ntpRaw)) {
+        $entered = @(
+            $ntpRaw -split ',' |
+                ForEach-Object { $_.Trim().Trim('"').Trim("'") } |
+                Where-Object   { $_ -match '\S' }
+        )
+
+        if ($entered.Count -gt 0) {
+            $NtpServers = $entered
+        }
+    }
+}
+
+Write-Log "  NTP server(s) to configure: $($NtpServers -join ', ')" -Color Green
 
 #endregion
 #region --- Credential Gathering ---
