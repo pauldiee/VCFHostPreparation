@@ -51,8 +51,9 @@
 
     Optional Advanced Settings
     --------------------------
-    Near the top of the script, the $OptionalAdvancedSettings block contains
-    extra settings that are disabled by default. Set Enabled = $true to apply:
+    Near the top of the script, the $DefaultOptionalAdvancedSettings block
+    contains extra settings that are disabled by default. Set Enabled = $true
+    to apply:
 
       - Config.HostAgent.plugins.hostsvc.esxAdminsGroup (string)
           AD group whose members receive full ESXi admin access.
@@ -63,6 +64,17 @@
 
       - DataMover.HardwareAcceleratedMove / HardwareAcceleratedInit (integer, 1/0)
           Enables SSD TRIM so ESXi issues UNMAP commands to compatible SSDs.
+
+    These settings can also be supplied from an external file placed next to
+    the script, instead of editing $DefaultOptionalAdvancedSettings in the
+    script body:
+
+      - HostPrep.Settings.json  (checked first)
+      - HostPrep.Settings.psd1  (checked if the .json file is not found)
+
+    If neither file is present, or a file fails to parse, the script falls
+    back to $DefaultOptionalAdvancedSettings. See Get-OptionalAdvancedSettings
+    for the loader and the expected file schema for each format.
 
     Host List File
     --------------
@@ -152,10 +164,10 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 4.1.1
+    Version : 4.2.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-07-08
+    Date    : 2026-07-14
 
     Changelog:
         1.0.0 - Initial release
@@ -309,6 +321,13 @@
                 same built-in ssh.exe via SSH_ASKPASS (keyboard-interactive);
                 ssh-keygen and the HTTPS PUT are gone. Still no external
                 module dependencies. (GitHub issue #3)
+        4.2.0 - Optional advanced settings can now be supplied externally:
+                added Get-OptionalAdvancedSettings, which loads
+                HostPrep.Settings.json (preferred) or HostPrep.Settings.psd1
+                (fallback) from the script directory, falling back to the
+                built-in $DefaultOptionalAdvancedSettings if neither file is
+                present or parsing fails; added matching .example template
+                files
 #>
 
 [CmdletBinding()]
@@ -344,10 +363,10 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "4.1.1"
+    Version = "4.2.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-07-08"
+    Date    = "2026-07-14"
 }
 
 #endregion
@@ -360,7 +379,11 @@ $ScriptMeta = @{
 # booleans as $true/$false. Using the wrong type will be silently accepted by
 # Set-AdvancedSetting but may have no effect  --  check the type note per setting.
 #
-$OptionalAdvancedSettings = @(
+# These are the built-in defaults, used only when neither HostPrep.Settings.json
+# nor HostPrep.Settings.psd1 is found next to the script (see
+# Get-OptionalAdvancedSettings in the Helper Functions region).
+#
+$DefaultOptionalAdvancedSettings = @(
 
     # ESX Admins group  --  the Active Directory group whose members are granted
     # full administrative access to the ESXi host. Change the value to match
@@ -1175,6 +1198,84 @@ function Get-ESXiStorageType {
     }
 }
 
+function Get-OptionalAdvancedSettings {
+    <#
+    .SYNOPSIS
+        Loads the optional advanced settings list, preferring an external
+        file next to the script over the built-in defaults.
+
+    .DESCRIPTION
+        Looks in the script directory for, in order:
+          1. HostPrep.Settings.json
+          2. HostPrep.Settings.psd1
+        The first one found is used. If neither exists, or the one found
+        fails to parse, $DefaultOptionalAdvancedSettings (defined at the top
+        of the script) is used instead.
+
+        JSON schema -- a top-level array of objects:
+          [
+            {
+              "Name":    "Config.HostAgent.plugins.hostsvc.esxAdminsGroup",
+              "Value":   "ESX Admins",
+              "Enabled": false,
+              "Label":   "ESX Admins group"
+            }
+          ]
+
+        PSD1 schema -- Import-PowerShellDataFile requires a top-level
+        hashtable, so the array is nested under a Settings key:
+          @{
+              Settings = @(
+                  @{
+                      Name    = "Config.HostAgent.plugins.hostsvc.esxAdminsGroup"
+                      Value   = "ESX Admins"
+                      Enabled = $false
+                      Label   = "ESX Admins group"
+                  }
+              )
+          }
+
+        Each entry needs Name, Value, Enabled and Label. Value types follow
+        the same rules as the built-in defaults: strings quoted, integers
+        unquoted, booleans as true/false ($true/$false in .psd1).
+
+    .OUTPUTS
+        Array of settings objects (PSCustomObject for JSON, Hashtable for
+        .psd1), each with Name, Value, Enabled and Label properties.
+    #>
+    param ()
+
+    $jsonPath = Join-Path $PSScriptRoot "HostPrep.Settings.json"
+    $psd1Path = Join-Path $PSScriptRoot "HostPrep.Settings.psd1"
+
+    if (Test-Path -LiteralPath $jsonPath -PathType Leaf) {
+        try {
+            $loaded = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json -ErrorAction Stop
+            Write-Log "  Loaded optional advanced settings from: $jsonPath" -Color DarkGray
+            return @($loaded)
+        } catch {
+            Write-Log "  Failed to parse $jsonPath ($_)" -Level WARN
+            Write-Log "  Falling back to $psd1Path or built-in defaults." -Level WARN
+        }
+    }
+
+    if (Test-Path -LiteralPath $psd1Path -PathType Leaf) {
+        try {
+            $data = Import-PowerShellDataFile -LiteralPath $psd1Path -ErrorAction Stop
+            if (-not $data.ContainsKey('Settings')) {
+                throw "top-level hashtable is missing a 'Settings' key."
+            }
+            Write-Log "  Loaded optional advanced settings from: $psd1Path" -Color DarkGray
+            return @($data.Settings)
+        } catch {
+            Write-Log "  Failed to parse $psd1Path ($_)" -Level WARN
+            Write-Log "  Falling back to built-in defaults." -Level WARN
+        }
+    }
+
+    Write-Log "  No HostPrep.Settings.json or HostPrep.Settings.psd1 found -- using built-in default optional advanced settings." -Color DarkGray
+    return $DefaultOptionalAdvancedSettings
+}
 
 function Invoke-VSANDiskWipe {
     <#
@@ -1768,6 +1869,18 @@ function copyThumb(btn) {
 
     $html | Out-File -FilePath $ReportPath -Encoding UTF8
     Write-Log ("  HTML report written to: {0}" -f $ReportPath)
+}
+
+#endregion
+#region --- Optional Advanced Settings (Load) ---
+
+$OptionalAdvancedSettings = Get-OptionalAdvancedSettings
+
+$enabledOptionalPreview = @($OptionalAdvancedSettings | Where-Object { $_.Enabled -eq $true })
+if ($enabledOptionalPreview.Count -gt 0) {
+    Write-Log ("  Optional advanced settings enabled: " + (($enabledOptionalPreview | ForEach-Object { $_.Label }) -join ', ')) -Color DarkGray
+} else {
+    Write-Log "  No optional advanced settings enabled." -Color DarkGray
 }
 
 #endregion
