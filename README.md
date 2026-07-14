@@ -4,7 +4,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 
 | Script | Version | Purpose |
 |---|---|---|
-| `HostPrep.ps1` | 4.2.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
+| `HostPrep.ps1` | 4.3.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
 | `Commission-VCFHosts.ps1` | 3.1.4 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
@@ -21,7 +21,7 @@ Reads a plain text file with one ESXi FQDN per line and runs the following steps
 
 1. **DNS validation** — forward A record and reverse PTR lookup; flags mismatches before anything else runs
 2. **Connect** — connects directly to the host using the root account via PowerCLI
-3. **NTP** — verifies required NTP servers are configured and `ntpd` is running and set to start automatically
+3. **NTP** — prompts for the NTP server(s) if `-NtpServers` was not supplied, then verifies they are configured and `ntpd` is running and set to start automatically
 4. **Advanced Settings** — sets `Config.HostAgent.ssl.keyStore.allowSelfSigned = true`, required by SDDC Manager
 5. **Optional Advanced Settings** — applies any extra settings that are enabled, either in the script's built-in block or in an external settings file (see below)
 6. **Storage type detection** — detects the primary storage type for the commissioning CSV (see below)
@@ -79,7 +79,7 @@ After connecting to each host, `HostPrep.ps1` detects the storage type and write
 | Requirement | Notes |
 |---|---|
 | PowerShell 5.1 | Included with Windows 10 / Server 2016 and later |
-| VMware PowerCLI | `Install-Module -Name VMware.PowerCLI -Scope CurrentUser` |
+| VMware PowerCLI | `Install-Module -Name VMware.PowerCLI -Scope CurrentUser`. Install it for the **same PowerShell edition you run HostPrep with** — a copy under Windows PowerShell 5.1 is not visible to PowerShell 7, and vice versa. The script checks for PowerCLI at startup and exits with the install command if it is missing |
 | OpenSSH Client | Standard on Windows 10 1809+ / Windows 11 — required for automated cert regen and `-WipeDisk`. If missing: `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` |
 
 One-time PowerCLI setup (run once per user account):
@@ -88,7 +88,7 @@ One-time PowerCLI setup (run once per user account):
 Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
 ```
 
-SSH authentication uses a throwaway ed25519 keypair generated per run; the public key is installed on each host over HTTPS (`/host/ssh_root_authorized_keys`) and removed again when the host's SSH steps finish — no manual key setup or extra modules needed. Without the OpenSSH client the script prints per-host manual instructions for the certificate and disk wipe steps.
+SSH authenticates with the **root password** via `ssh.exe`'s `SSH_ASKPASS` helper — no key setup, no manual steps, no extra modules. (Earlier versions installed a throwaway ed25519 public key over HTTPS; ESXi 9 removed the `/host/ssh_root_authorized_keys` endpoint that relied on, so password auth over the built-in client is used instead — see issue #3.) Without the OpenSSH client the script prints per-host manual instructions for the certificate and disk wipe steps.
 
 ### Usage
 
@@ -116,7 +116,7 @@ SSH authentication uses a throwaway ed25519 keypair generated per run; the publi
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `-NtpServers` | `string[]` | `pool.ntp.org` | One or more NTP server addresses |
+| `-NtpServers` | `string[]` | `pool.ntp.org` | One or more NTP server addresses. If omitted, the script prompts before touching any host, with `pool.ntp.org` as the default that Enter accepts |
 | `-DryRun` | `switch` | — | Simulate all steps, no changes made |
 | `-WhatIfReport` | `switch` | — | Read thumbprints and generate report/CSV without changes |
 | `-LogPath` | `string` | Next to script | Path for the transcript log |
