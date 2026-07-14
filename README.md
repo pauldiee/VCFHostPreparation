@@ -4,7 +4,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 
 | Script | Version | Purpose |
 |---|---|---|
-| `HostPrep.ps1` | 4.0.9 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
+| `HostPrep.ps1` | 4.2.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
 | `Commission-VCFHosts.ps1` | 3.1.4 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
@@ -23,7 +23,7 @@ Reads a plain text file with one ESXi FQDN per line and runs the following steps
 2. **Connect** — connects directly to the host using the root account via PowerCLI
 3. **NTP** — verifies required NTP servers are configured and `ntpd` is running and set to start automatically
 4. **Advanced Settings** — sets `Config.HostAgent.ssl.keyStore.allowSelfSigned = true`, required by SDDC Manager
-5. **Optional Advanced Settings** — applies any extra settings enabled in the `$OptionalAdvancedSettings` block
+5. **Optional Advanced Settings** — applies any extra settings that are enabled, either in the script's built-in block or in an external settings file (see below)
 6. **Storage type detection** — detects the primary storage type for the commissioning CSV (see below)
 6b. **vSAN disk wipe** *(optional, `-WipeDisk` only)* — enumerates non-boot disks with existing partitions and wipes them via `partedUtil` over SSH, preparing disks for clean vSAN commissioning (see below)
 7. **Certificate regeneration** — reads the TLS certificate from port 443 and checks whether the CN matches the host FQDN. If not: temporarily enables SSH, runs `/sbin/generate-certificates` via the built-in Windows OpenSSH client, disables SSH, reboots, waits for the host to return online
@@ -137,7 +137,7 @@ esxi04.vcf.lab
 
 ### Optional Advanced Settings
 
-The `$OptionalAdvancedSettings` block near the top of the script contains extra settings, all disabled by default. Set `Enabled = $true` to apply on every host:
+Extra advanced settings, all disabled by default. Whichever source is used, set `Enabled` to true to apply the setting on every host:
 
 | Setting | Description |
 |---|---|
@@ -145,6 +145,38 @@ The `$OptionalAdvancedSettings` block near the top of the script contains extra 
 | `LSOM.lsomEnableRebuildOnLSE` | Enables automatic vSAN rebuild when a device is flagged as LSE |
 | `DataMover.HardwareAcceleratedMove` | Enables SSD TRIM — ESXi issues UNMAP to compatible SSDs |
 | `DataMover.HardwareAcceleratedInit` | Enables SSD TRIM — ESXi issues UNMAP to compatible SSDs |
+
+These settings can come from an external file next to the script, so you don't have to edit the script body. On startup the script looks for, in order:
+
+1. `HostPrep.Settings.json`
+2. `HostPrep.Settings.psd1`
+
+The first file found wins. If neither exists — or the file that was found fails to parse — the script falls back to the built-in `$DefaultOptionalAdvancedSettings` block near the top of `HostPrep.ps1`. The source in use is written to the log at startup, along with the labels of any settings that are enabled.
+
+Copy one of the shipped templates to get started:
+
+```powershell
+# JSON -- a top-level array of objects
+Copy-Item HostPrep.Settings.example.json HostPrep.Settings.json
+
+# ...or PSD1 -- the array nested under a Settings key
+Copy-Item HostPrep.Settings.example.psd1 HostPrep.Settings.psd1
+```
+
+Each entry needs `Name`, `Value`, `Enabled` and `Label`. Value types matter: strings quoted, integers unquoted, booleans as `true`/`false` in JSON and `$true`/`$false` in `.psd1`. A wrong type is accepted silently by ESXi but may have no effect.
+
+```json
+[
+    {
+        "Name": "Config.HostAgent.plugins.hostsvc.esxAdminsGroup",
+        "Value": "ESX Admins",
+        "Enabled": true,
+        "Label": "ESX Admins group"
+    }
+]
+```
+
+The two formats differ in shape — JSON is a bare array, while `.psd1` must wrap the array in a `Settings` key because `Import-PowerShellDataFile` requires a top-level hashtable. Follow the matching template rather than translating one format into the other by hand.
 
 ### VCF 9 password requirements
 
