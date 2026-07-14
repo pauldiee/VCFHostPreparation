@@ -1,0 +1,28 @@
+@{
+    Settings = @(
+        @{
+            Name    = "Config.HostAgent.plugins.hostsvc.esxAdminsGroup"
+            Value   = "ESX Admins"
+            Enabled = $false
+            Label   = "ESX Admins group"
+        },
+        @{
+            Name    = "LSOM.lsomEnableRebuildOnLSE"
+            Value   = 1
+            Enabled = $false
+            Label   = "vSAN rebuild on LSE"
+        },
+        @{
+            Name    = "DataMover.HardwareAcceleratedMove"
+            Value   = 1
+            Enabled = $false
+            Label   = "SSD TRIM - HardwareAcceleratedMove"
+        },
+        @{
+            Name    = "DataMover.HardwareAcceleratedInit"
+            Value   = 1
+            Enabled = $false
+            Label   = "SSD TRIM - HardwareAcceleratedInit"
+        }
+    )
+}
