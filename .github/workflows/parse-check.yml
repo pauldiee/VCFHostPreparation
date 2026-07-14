@@ -1,0 +1,44 @@
+name: Parse check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  parse:
+    name: PowerShell syntax
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse all PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+
+          Get-ChildItem -Path . -Filter *.ps1 -Recurse -File | ForEach-Object {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                  $_.FullName, [ref]$null, [ref]$errors
+              ) | Out-Null
+
+              if ($errors) {
+                  $failed = $true
+                  foreach ($e in $errors) {
+                      $line = $e.Extent.StartLineNumber
+                      $col  = $e.Extent.StartColumnNumber
+                      # Surfaces the error as an inline annotation on the diff
+                      Write-Output "::error file=$($_.Name),line=$line,col=$col::$($e.Message)"
+                  }
+                  Write-Output "FAIL  $($_.Name) -- $($errors.Count) parse error(s)"
+              } else {
+                  Write-Output "OK    $($_.Name)"
+              }
+          }
+
+          if ($failed) {
+              throw "One or more scripts failed to parse."
+          }
