@@ -4,7 +4,7 @@ Two PowerShell scripts that automate ESXi host preparation and commissioning for
 
 | Script | Version | Purpose |
 |---|---|---|
-| `HostPrep.ps1` | 4.4.0 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
+| `HostPrep.ps1` | 4.4.1 | Prepares ESXi hosts — DNS, NTP, certificates, storage detection, disk wipe, advanced settings, password reset |
 | `Commission-VCFHosts.ps1` | 3.1.4 | Commissions prepared hosts into SDDC Manager via the REST API |
 
 Run `HostPrep.ps1` first, then hand the generated CSV to `Commission-VCFHosts.ps1`.
