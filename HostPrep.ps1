@@ -170,10 +170,10 @@
 
 .NOTES
     Script  : HostPrep.ps1
-    Version : 4.4.0
+    Version : 4.4.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-07-14
+    Date    : 2026-11-17
 
     Changelog:
         1.0.0 - Initial release
@@ -353,6 +353,12 @@
                 detected up front: ESXi ignores a hostname set while DHCP is in
                 charge, so the script explains that and points at the static-DNS
                 setting instead of silently failing. (GitHub issue #8)
+        4.4.1 - PowerCLI loader (same as FCHbaPathState v2.7): imports
+                VMware.VimAutomation.Core with -ErrorAction Stop, stops when
+                PowerCLI modules of different versions are already loaded,
+                clear error with the loaded modules and a link to the
+                jump-host guide, install hint per vCenter version (VCF.PowerCLI
+                for vCenter 9). (GitHub issue #12)
 #>
 
 [CmdletBinding()]
@@ -388,10 +394,10 @@ param (
 
 $ScriptMeta = @{
     Name    = "HostPrep.ps1"
-    Version = "4.4.0"
+    Version = "4.4.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-07-14"
+    Date    = "2026-11-17"
 }
 
 #endregion
@@ -505,23 +511,71 @@ function Write-Log {
 # of "not recognized" errors and the script carries on to prompt for the host
 # list, NTP servers and the root password before finally dying at Connect-VIServer.
 #
+# The script needs only VMware.VimAutomation.Core (and what it requires), not
+# the whole PowerCLI bundle. Loading problems almost always come from the
+# jump host (several PowerCLI versions side by side, an old one already loaded
+# in the session, an incomplete or blocked offline install); the fix belongs
+# there, so the script only explains what it found and where to read on.
+# Same loader as FCHbaPathState v2.7 and VDSPortGroupManager v1.3.0.
+#
 # Deliberately uses Write-Host rather than Write-Log: the log file is created
 # further down, and this check must run before the Get-PowerCLIConfiguration
 # calls immediately below.
-if (-not (Get-Module -ListAvailable -Name VMware.VimAutomation.Core)) {
-    Write-Host ""
-    Write-Host "  ERROR: VMware PowerCLI was not found." -ForegroundColor Red
-    Write-Host "  HostPrep needs it to connect to the ESXi hosts and cannot continue." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "  Install it for the current user (no admin rights required):" -ForegroundColor Yellow
-    Write-Host "    Install-Module -Name VMware.PowerCLI -Scope CurrentUser" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host ("  This session is PowerShell {0} ({1}). PowerCLI must be installed for the" -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition) -ForegroundColor DarkGray
-    Write-Host "  same edition you run HostPrep with  --  a copy installed under Windows" -ForegroundColor DarkGray
-    Write-Host "  PowerShell 5.1 is not visible to PowerShell 7, and vice versa." -ForegroundColor DarkGray
-    Write-Host ""
+$jumpHostGuide = 'https://vcf-planning.hollebollevsan.nl/docs/42-jump-host-powershell/'
+
+function Stop-ModuleLoadFailure {
+    param([string]$Reason)
+    Write-Host ''
+    Write-Host '  [ERROR] Could not load PowerCLI (VMware.VimAutomation.Core).' -ForegroundColor Red
+    if ($Reason) { Write-Host "          $Reason" -ForegroundColor Red }
+    Write-Host '          Start a clean session with "pwsh -NoProfile" and run the script first.' -ForegroundColor Yellow
+    Write-Host '          Keep one complete, unblocked PowerCLI version on this host; see the jump-host' -ForegroundColor Yellow
+    Write-Host "          guide, section 4 (completeness check) and 6 (pitfalls): $jumpHostGuide" -ForegroundColor Yellow
+    $loaded = @(Get-Module -Name VMware.*, VCF.PowerCLI)
+    if ($loaded.Count -gt 0) {
+        Write-Host '          Loaded now:' -ForegroundColor Yellow
+        $loaded | Sort-Object Name | ForEach-Object {
+            Write-Host "            $($_.Name) $($_.Version)  ($($_.ModuleBase))" -ForegroundColor Yellow
+        }
+    }
     exit 1
 }
+function Get-ShortError {
+    param($ErrorRecord)
+    $m = "$($ErrorRecord.Exception.Message)"
+    if ($m -match "`t") { $m = @($m -split "`t" | Where-Object { $_.Trim() })[-1].Trim() }
+    return $m
+}
+
+if (-not (Get-Module -ListAvailable -Name VMware.VimAutomation.Core)) {
+    Write-Host ''
+    Write-Host '  [ERROR] No PowerCLI found (VMware.VimAutomation.Core is not installed).' -ForegroundColor Red
+    Write-Host '          HostPrep needs it to connect to the ESXi hosts and cannot continue.' -ForegroundColor Red
+    Write-Host '          vCenter 9:     Install-Module -Name VCF.PowerCLI -Scope CurrentUser   (needs PowerShell 7, KB 409981)' -ForegroundColor Yellow
+    Write-Host '          vCenter 7 / 8: Install-Module -Name VMware.PowerCLI -Scope CurrentUser  (KB 428547)' -ForegroundColor Yellow
+    Write-Host "          Without internet access: $jumpHostGuide (section 3)" -ForegroundColor Yellow
+    Write-Host ("          This session is PowerShell {0} ({1}). A PowerCLI installed for the current" -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition) -ForegroundColor DarkGray
+    Write-Host '          user under Windows PowerShell 5.1 is not visible to PowerShell 7, and vice versa.' -ForegroundColor DarkGray
+    Write-Host ''
+    exit 1
+}
+
+# All VMware.VimAutomation.* modules of one PowerCLI release share one version
+# (13.5.1.x for VCF.PowerCLI 9.1.1); StorageUtility is versioned on its own.
+$loadedVersions = @(Get-Module -Name VMware.VimAutomation.* |
+    Where-Object { $_.Name -ne 'VMware.VimAutomation.StorageUtility' } |
+    ForEach-Object { "$($_.Version)" } | Select-Object -Unique)
+if ($loadedVersions.Count -gt 1) {
+    Stop-ModuleLoadFailure -Reason "PowerCLI modules of different versions are already loaded in this session ($($loadedVersions -join ', '))."
+}
+
+try {
+    Import-Module -Name VMware.VimAutomation.Core -ErrorAction Stop -WarningAction SilentlyContinue 6>$null
+}
+catch {
+    Stop-ModuleLoadFailure -Reason (Get-ShortError $_)
+}
+Write-Host "  [INFO] PowerCLI $(@(Get-Module -Name VMware.VimAutomation.Core)[0].Version) loaded." -ForegroundColor Cyan
 
 # Suppress PowerCLI CEIP nag. The warning fires on first module load in any
 # new session, so we persist the opt-out to the User scope once and silently
